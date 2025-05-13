@@ -1,0 +1,15 @@
+fn sys_write(fd: int, buff: ptr, len: int) -> int {
+    syscall(1, fd, buff, len)
+}
+
+fn sys_exit(code: int) -> void {
+    syscall(60, code)
+}
+
+fn brk(addr: ptr) -> ptr {
+    syscall(12, addr) // For !safe manual operations
+}
+
+fn mmap(addr: ptr, len: int, prot: int, flags: int, fd: int, offset: int) -> ptr {
+    syscall(9, addr, len, prot, flags, fd, offset)
+}
