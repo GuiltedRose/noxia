@@ -1,0 +1,22 @@
+import "./stdlib/sys"
+
+fn thread_trampoline(func: ptr, arg: ptr) -> void {
+    let f = cast(func as fn(arg: ptr) -> int)
+    let exit_code = f(arg)
+    sys_exit(exit_code)
+} // Thread Entry Point
+
+extern fn thread_trampoline(func: ptr, arg: ptr) -> void
+
+fn thread_spawn(func: ptr, arg: ptr, stack: ptr) -> int {
+    // Push func and arg onto stack (stack grows down)
+    let stack_top = stack - 16
+    let sp = cast(stack_top as *ptr)
+    sp[0] = func
+    sp[1] = arg
+
+    // Clone flags: CLONE_VM | FS | FILES | SIGHAND | THREAD
+    let flags = 0x00000100 | 0x00000200 | 0x00000400 | 0x00000800 | 0x00010000
+
+    return clone(flags, stack_top, thread_trampoline)
+}
