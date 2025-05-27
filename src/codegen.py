@@ -1,3 +1,5 @@
+from ir import IRBuilder
+
 class CodeGenerator:
     def __init__(self):
         self.output = []
