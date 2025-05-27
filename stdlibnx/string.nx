@@ -1,0 +1,6 @@
+fn memset(dest: ptr, val: int, len: int) -> void {
+    let p = cast(dest as *byte)
+    for let i = 0; i < len; i = i + 1 {
+        p[i] = val
+    }
+}

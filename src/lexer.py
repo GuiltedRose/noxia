@@ -1,6 +1,6 @@
 KEYWORDS = {
     "let", "fn", "match", "return", "if", "else", "true", "false", "&mut", "!safe",
-    "class", "public", "private", "const", "struct", "enum", "import"
+    "class", "public", "private", "const", "struct", "enum", "import", "as", "global", "cast"
 }
 
 TYPES = {

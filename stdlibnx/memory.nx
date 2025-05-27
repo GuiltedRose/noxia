@@ -1,0 +1,22 @@
+import "./stdlibnx/alloc"
+import "./stdlibnx/string"
+
+const HEADER_SIZE = 8
+
+fn malloc(size: int) -> ptr {
+    let total = size + HEADER_SIZE
+    let raw = sbrk(total)
+    let meta = cast(raw as *int)
+    meta[0] = size
+    return raw + HEADER_SIZE
+}
+
+fn free(ptr: ptr) -> void {
+    // TODO: no-op in bump allocator
+}
+
+fn calloc(size: int) -> ptr {
+    let ptr = malloc(size)
+    memset(ptr, 0, size)
+    return ptr
+}

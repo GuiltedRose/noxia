@@ -1,0 +1,12 @@
+import "./stdlibnx/sys"
+
+fn sbrk(len: int) -> ptr {
+    static curr: ptr = 0
+    if curr == 0 {
+        curr = brk(0)
+    }
+    
+    let next = curr
+    curr = brk(curr + len)
+    return next
+}
