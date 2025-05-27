@@ -53,6 +53,6 @@ class Compiler:
             f.write(asm)
 
         subprocess.run(["nasm", "-f", "elf64", asm_path, "-o", "bin/program.o"])
-        subprocess.run(["clang", "-nostdlib", "-static", "-o", "bin/program", "bin/program.o"])
+        subprocess.run(["gcc", "-nostdlib", "-static", "-o", "bin/program", "bin/program.o"])
 
         print("[✓] Build complete — binary at bin/program")
