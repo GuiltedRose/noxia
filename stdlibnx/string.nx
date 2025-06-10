@@ -4,3 +4,39 @@ fn memset(dest: ptr, val: int, len: int) -> void {
         p[i] = val
     }
 }
+
+fn strlen(s: ptr) -> int {
+    let p = cast(s as *byte)
+    let i = 0
+    while p[i] != 0 {
+        i = i + 1
+    }
+
+    return i
+}
+
+fn strcmp(a: ptr, b: ptr) -> int {
+  let pa = cast(a as *byte)
+  let pb = cast(b as *byte)
+  let i = 0
+  while pa[i] != 0 && pb[i] != 0 {
+    if pa[i] != pb[i] {
+      return pa[i] - pb[i]
+    }
+    i = i + 1
+  }
+  return pa[i] - pb[i]
+}
+
+fn strcpy(dest: ptr, src: ptr) -> ptr {
+  let d = cast(dest as *byte)
+  let s = cast(src as *byte)
+  let i = 0
+  while s[i] != 0 {
+    d[i] = s[i]
+    i = i + 1
+  }
+  d[i] = 0
+  return dest
+}
+

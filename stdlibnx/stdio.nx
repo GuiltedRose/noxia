@@ -1,0 +1,13 @@
+import "./stdlibnx/sys"
+
+fn open(path: ptr, flags: int, mode: int) -> int {
+  return syscall(2, path, flags, mode)
+}
+
+fn read(fd: int, buf: ptr, len: int) -> int {
+  return syscall(0, fd, buf, len)
+}
+
+fn close(fd: int) -> int {
+  return syscall(3, fd)
+}
