@@ -1,0 +1,6 @@
+import "/home/zelda/repos/noxia/stdlibnx/print"
+
+fn _start() -> void {
+    puts("Hello from Noxia!")
+    sys_exit(0)
+}

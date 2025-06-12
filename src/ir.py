@@ -1,11 +1,9 @@
-from semantics import SemanticAnalyzer
-
 class IRBuilder:
     def __init__(self):
         self.instructions = []
         self.register_count = 0
         self.label_count = 0
-        self.symbol_table = {}  # maps variable names → registers or global symbols
+        self.symbol_table = {}
         self.functions = []
 
     def new_reg(self):
@@ -37,10 +35,8 @@ class IRBuilder:
     def compile_Variable(self, node):
         name = node["name"]
         if name in self.symbol_table:
-            reg_or_symbol = self.symbol_table[name]
-            if isinstance(reg_or_symbol, str) and reg_or_symbol.startswith("global:"):
-                return reg_or_symbol.split(":", 1)[1]
-            return reg_or_symbol
+            ref = self.symbol_table[name]
+            return ref.split(":", 1)[1] if ref.startswith("global:") else ref
         raise Exception(f"[IRBuilderError] Unknown variable '{name}'")
 
     def compile_BinaryExpr(self, node):
@@ -51,22 +47,25 @@ class IRBuilder:
         return dest
 
     def compile_expr(self, node):
-        if node["type"] == "Literal":
+        kind = node["type"]
+        if kind == "Literal":
             return self.compile_Literal(node)
-        elif node["type"] == "Variable":
+        elif kind == "Variable":
             return self.compile_Variable(node)
-        elif node["type"] == "BinaryExpr":
+        elif kind == "BinaryExpr":
             return self.compile_BinaryExpr(node)
-        elif node["type"] == "CallExpr":
+        elif kind == "CallExpr":
             return self.compile_CallExpr(node)
-        elif node["type"] == "CastExpr":
+        elif kind == "CastExpr":
             return self.compile_CastExpr(node)
-        elif node["type"] == "UnsafeBlockExpr":
+        elif kind == "UnsafeBlockExpr":
             return self.compile_UnsafeBlockExpr(node)
-        raise Exception(f"[IRBuilderError] Unknown expr type: {node['type']}")
+
+        print(f"[debug] compile_expr → unknown kind: {kind} → {node}")
+        raise Exception(f"[IRBuilderError] Unknown expr type: {kind}")
 
     def compile_LetStatement(self, node):
-        dest = self.compile_expr(node["init"])
+        dest = self.compile_expr(node["init"])  # ← FIXED from "value" to "init"
         self.symbol_table[node["name"]] = dest
 
     def compile_ReturnStatement(self, node):
@@ -74,28 +73,33 @@ class IRBuilder:
         self.emit({ "op": "ret", "value": reg })
 
     def compile_ExprStatement(self, node):
-        self.compile_expr(node["expr"])
+        self.compile_expr(node["expr"])  # Could optionally save reg here
 
     def compile_block(self, block):
         for stmt in block:
-            kind = stmt["type"]
-            if kind == "LetStatement":
-                self.compile_LetStatement(stmt)
-            elif kind == "ReturnStatement":
-                self.compile_ReturnStatement(stmt)
-            elif kind == "ExprStatement":
-                self.compile_ExprStatement(stmt)
-            elif kind == "IfStatement":
-                self.compile_IfStatement(stmt)
-            elif kind == "MatchStatement":
-                self.compile_MatchStatement(stmt)
-            else:
-                raise Exception(f"[IRBuilderError] Unknown stmt: {kind}")
+            match stmt["type"]:
+                case "LetStatement":
+                    self.compile_LetStatement(stmt)
+                case "ReturnStatement":
+                    self.compile_ReturnStatement(stmt)
+                case "ExprStatement":
+                    self.compile_ExprStatement(stmt)
+                case "IfStatement":
+                    self.compile_IfStatement(stmt)
+                case "MatchStatement":
+                    self.compile_MatchStatement(stmt)
+                case "UnsafeBlock":
+                    self.compile_block(stmt["body"])
+                case _:
+                    raise Exception(f"[IRBuilderError] Unknown stmt: {stmt['type']}")
 
     def compile_FunctionDecl(self, node):
         self.instructions = []
         self.symbol_table = {}
         self.register_count = 0
+
+        if node["name"] == "_start":
+            node["params"] = []  # ← ensure no params for _start
 
         param_regs = []
         for i, param in enumerate(node["params"]):
@@ -140,7 +144,6 @@ class IRBuilder:
         end_label = self.new_label("endif")
 
         self.emit({ "op": "jeq", "src1": cond_reg, "src2": "0", "label": else_label })
-
         self.compile_block(node["then"])
         self.emit({ "op": "jmp", "label": end_label })
 
@@ -157,10 +160,7 @@ class IRBuilder:
         for arm in node["arms"]:
             arm_label = self.new_label("arm")
             pattern_reg = self.compile_expr(arm["pattern"])
-
-            self.emit({
-                "op": "jeq", "src1": match_reg, "src2": pattern_reg, "label": arm_label
-            })
+            self.emit({ "op": "jeq", "src1": match_reg, "src2": pattern_reg, "label": arm_label })
 
             self.emit({ "op": "label", "name": arm_label })
             self.compile_block(arm["body"])
@@ -169,42 +169,15 @@ class IRBuilder:
         self.emit({ "op": "label", "name": end_label })
 
     def format_type(self, t):
-        if isinstance(t, str):
-            return t
-        elif t["type"] == "NamedType":
-            return t["name"]
-        elif t["type"] == "PointerType":
-            return f"*{self.format_type(t['base'])}"
-        elif t["type"] == "ArrayType":
-            return f"{self.format_type(t['element'])}[{t['length']}]"
-        else:
-            raise Exception(f"[IRBuilderError] Unknown type node in cast: {t}")
+        if isinstance(t, str): return t
+        if isinstance(t, dict) and t.get("type") == "Type": return t["name"]
+        return str(t)
 
     def compile_CastExpr(self, node):
-        src_expr = node["Expr"]
-        target_type = node["target_type"]
-
-        src_reg = self.compile_expr(src_expr)
+        src_reg = self.compile_expr(node["expr"])
         dest = self.new_reg()
-        type_str = self.format_type(target_type)
-
-        inferred_src_type = None
-        if isinstance(src_expr, dict) and "type" in src_expr:
-            if src_expr["type"] == "Literal":
-                inferred_src_type = type(src_expr["value"]).__name__
-            elif src_expr["type"] == "Variable":
-                var_name = src_expr["name"]
-                inferred_src_type = self.symbol_table.get(var_name + "_type")
-
-        if inferred_src_type and type_str.startswith("*") and inferred_src_type in ["str", "string"]:
-            raise Exception(f"[UnsafeCastError] Cannot cast string to pointer without unsafe block")
-
-        self.emit({
-            "op": "cast",
-            "src": src_reg,
-            "to": type_str,
-            "dest": dest
-        })
+        type_str = self.format_type(node["target_type"])
+        self.emit({ "op": "cast", "src": src_reg, "to": type_str, "dest": dest })
         return dest
 
     def compile_UnsafeBlockExpr(self, node):
@@ -220,7 +193,6 @@ class IRBuilder:
         name = node["name"]
         value_reg = self.compile_expr(node["value"])
         self.symbol_table[name] = f"global:{name}"
-
         self.functions.append({
             "type": "Global",
             "name": name,

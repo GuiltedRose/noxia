@@ -70,12 +70,13 @@ class Lexer:
                 while self.peek() and (self.peek().isalnum() or self.peek() == '_'):
                     self.advance()
                 value = self.src[start:self.pos]
-                if value in KEYWORDS:
-                    self.add_token("KEYWORD", value, start_line, start_col)
-                elif value in TYPES:
+                if value in TYPES:
                     self.add_token("TYPE", value, start_line, start_col)
+                elif value in KEYWORDS:
+                    self.add_token("KEYWORD", value, start_line, start_col)
                 else:
                     self.add_token("IDENT", value, start_line, start_col)
+
 
             # Number or Float
             elif c.isdigit():

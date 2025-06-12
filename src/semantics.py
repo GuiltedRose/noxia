@@ -98,19 +98,16 @@ class SemanticAnalyzer:
 
         elif node_type == "CastExpr":
             expr_type = self.infer_type(node["expr"])
-            target_type = node["target_type"]
+            target_node = node.get("target_type")
+            target_type = self.rewrite_type(target_node)
 
-            # Simple example rules — expand as needed
             if expr_type == target_type:
-                return target_type  # no-op cast
-
+                return target_type
             if self.is_numeric(expr_type) and self.is_numeric(target_type):
-                return target_type  # allow numeric cast
-
+                return target_type
             if self.is_pointer(expr_type) and self.is_pointer(target_type):
-                return target_type  # allow pointer-to-pointer cast
+                return target_type
 
-            # Disallow all other cases
             self.errors.append(f"[TypeError] Invalid cast from {expr_type} to {target_type}")
             return target_type
 
@@ -138,17 +135,22 @@ class SemanticAnalyzer:
 
     def visit_LetStatement(self, node):
         declared = node.get("var_type")
-        inferred = self.infer_type(node["init"])
-        if isinstance(declared, dict):  # if it's a RefType object
+        value_expr = node.get("value")
+        inferred = self.infer_type(value_expr)
+
+        if isinstance(declared, dict):  # if it's a RefType or Type node
             parsed = self.rewrite_type(declared)
             node["var_type"] = parsed
             declared = parsed
+
         if declared and inferred and declared != inferred:
             self.errors.append(f"[TypeError] Cannot assign {inferred} to '{node['name']}' of type {declared}")
+
         if not declared:
             node["var_type"] = inferred
+
         self.declare_symbol(node["name"], node)
-        self.visit(node.get("init"))
+        self.visit(value_expr)
 
     def visit_GlobalDecl(self, node):
         name = node["name"]
@@ -179,11 +181,18 @@ class SemanticAnalyzer:
             self.visit_type({"type": "Type", "name": node.get("inner")})
 
     def rewrite_type(self, node):
-        if node["type"] == "RefType":
-            return f"&mut {node['inner']}" if node["mutable"] else f"&{node['inner']}"
-        if node["type"] == "Type":
-            return node["name"]
-        return None
+        if isinstance(node, dict):
+            if node.get("type") == "RefType":
+                return f"&mut {node['inner']}" if node["mutable"] else f"&{node['inner']}"
+            elif node.get("type") == "Type":
+                return node["name"]
+        return node
+
+    def is_numeric(self, t):
+        return isinstance(t, str) and t.startswith("int") or t.startswith("uint") or t == "float"
+
+    def is_pointer(self, t):
+        return isinstance(t, str) and (t.startswith("&") or "*" in t)
 
     def visit_block(self, block):
         for stmt in block:
@@ -191,9 +200,9 @@ class SemanticAnalyzer:
 
     def visit_CastExpr(self, node):
         expr_type = self.infer_type(node["expr"])
-        target = node.get("target_type")
-        if expr_type != target:
-            self.errors.append(f"[TypeError] Cannot cast from {expr_type} to {target}")
+        target_type = self.rewrite_type(node.get("target_type"))
+        if expr_type != target_type:
+            self.errors.append(f"[TypeError] Cannot cast from {expr_type} to {target_type}")
         self.visit(node["expr"])
 
     def visit_EnumDecl(self, node):

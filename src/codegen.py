@@ -1,5 +1,3 @@
-from ir import IRBuilder
-
 class CodeGenerator:
     def __init__(self):
         self.output = []
@@ -27,7 +25,7 @@ class CodeGenerator:
         self.emit(f"{name}:")
         for instr in func["body"]:
             self.generate_instr(instr)
-        self.emit("")  # spacing
+        self.emit("")
 
     def generate_instr(self, instr):
         op = instr["op"]
@@ -81,107 +79,71 @@ class CodeGenerator:
             self.emit(f"mov {self.map_reg(instr['dest'])}, rax")
 
         elif op == "cast":
-            # Generic cast pseudo-instruction:
-            # emit a comment for types, then just mov for now
-            from_type = instr.get("from", "unknown")
-            to_type = instr.get("to", "unknown")
+            src = self.map_reg(instr["src"])
+            dest = self.map_reg(instr["dest"])
+            from_type = instr.get("from")
+            to_type = instr.get("to")
+
             self.emit(f"; cast {from_type} -> {to_type}")
-            self.emit(f"mov {self.map_reg(instr['dest'])}, {self.map_reg(instr['src'])}")
+
+            if not from_type or not to_type:
+                self.emit(f"mov {dest}, {src}")
+                return
+
+            int_types = {"int8", "int16", "int32", "int64"}
+            float_types = {"float", "double"}
+
+            def bits(t):
+                return {
+                    "int8": 8, "int16": 16, "int32": 32, "int64": 64,
+                    "float": 32, "double": 64
+                }.get(t, 64)
+
+            if from_type in int_types and to_type in int_types:
+                f_bits, t_bits = bits(from_type), bits(to_type)
+                if f_bits == t_bits:
+                    self.emit(f"mov {dest}, {src}")
+                elif f_bits < t_bits:
+                    if f_bits == 8:
+                        self.emit(f"movsx {dest}, byte {src}")
+                    elif f_bits == 16:
+                        self.emit(f"movsx {dest}, word {src}")
+                    elif f_bits == 32:
+                        self.emit(f"movsxd {dest}, {src}")
+                    else:
+                        self.emit(f"mov {dest}, {src}")
+                else:
+                    self.emit(f"mov {dest}, {src}")
+                return
+
+            if from_type in int_types and to_type in float_types:
+                if src != "rax":
+                    self.emit(f"mov rax, {src}")
+                if to_type == "float":
+                    self.emit(f"cvtsi2ss xmm0, rax")
+                else:
+                    self.emit(f"cvtsi2sd xmm0, rax")
+                self.emit(f"movaps {dest}, xmm0")
+                return
+
+            if from_type in float_types and to_type in int_types:
+                if from_type == "float":
+                    self.emit(f"cvttss2si {dest}, xmm0")
+                else:
+                    self.emit(f"cvttsd2si {dest}, xmm0")
+                return
+
+            if from_type == "float" and to_type == "double":
+                self.emit(f"cvtss2sd xmm0, xmm0")
+                self.emit(f"movaps {dest}, xmm0")
+                return
+
+            if from_type == "double" and to_type == "float":
+                self.emit(f"cvtsd2ss xmm0, xmm0")
+                self.emit(f"movaps {dest}, xmm0")
+                return
+
+            self.emit(f"mov {dest}, {src}")
 
         else:
             raise Exception(f"Unknown opcode: {op}")
-
-    def _generate_cast(self, instr):
-        src = self.map_reg(instr["src"])
-        dest = self.map_reg(instr["dest"])
-        from_type = instr.get("from")  # optional, might not be present
-        to_type = instr.get("to")
-
-        # If from_type missing, fallback to simple mov
-        if from_type is None or to_type is None:
-            self.emit(f"mov {dest}, {src}")
-            return
-
-        # Pointer casts: just mov
-        if from_type == "ptr" or to_type == "ptr":
-            self.emit(f"mov {dest}, {src}")
-            return
-
-        # Integer widening/narrowing
-        int_types = {"int8", "int16", "int32", "int64"}
-        float_types = {"float", "double"}
-
-        # Helper to get size in bits
-        def size_in_bits(t):
-            sizes = {
-                "int8": 8,
-                "int16": 16,
-                "int32": 32,
-                "int64": 64,
-                "float": 32,
-                "double": 64,
-            }
-            return sizes.get(t, 64)
-
-        if from_type in int_types and to_type in int_types:
-            from_bits = size_in_bits(from_type)
-            to_bits = size_in_bits(to_type)
-
-            if from_bits == to_bits:
-                # Same size int: just mov
-                self.emit(f"mov {dest}, {src}")
-            elif from_bits < to_bits:
-                # Widening - use movsx (sign extend) or movzx (zero extend)
-                # For now, assume signed extension
-                if from_bits == 8:
-                    self.emit(f"movsx {dest}, byte {src}")
-                elif from_bits == 16:
-                    self.emit(f"movsx {dest}, word {src}")
-                elif from_bits == 32:
-                    # movsx for 32 -> 64 bit
-                    self.emit(f"movsxd {dest}, {src}")
-                else:
-                    self.emit(f"mov {dest}, {src}")  # fallback
-            else:
-                # Narrowing - just mov; upper bits ignored
-                self.emit(f"mov {dest}, {src}")
-
-            return
-
-        # Int to float/double
-        if from_type in int_types and to_type in float_types:
-            # Use cvtsi2ss (int->float) or cvtsi2sd (int->double)
-            if to_type == "float":
-                # mov src to eax first if needed (cvtsi2ss uses eax)
-                if src != "rax":
-                    self.emit(f"mov rax, {src}")
-                self.emit(f"cvtsi2ss xmm0, rax")
-                self.emit(f"movaps {dest}, xmm0")  # store xmm0 to dest register (assume dest is xmm)
-            else:
-                if src != "rax":
-                    self.emit(f"mov rax, {src}")
-                self.emit(f"cvtsi2sd xmm0, rax")
-                self.emit(f"movaps {dest}, xmm0")
-            return
-
-        # Float/double to int
-        if from_type in float_types and to_type in int_types:
-            # Use cvttss2si or cvttsd2si
-            if from_type == "float":
-                self.emit(f"cvttss2si {dest}, xmm0")
-            else:
-                self.emit(f"cvttsd2si {dest}, xmm0")
-            return
-
-        # Float to double or double to float
-        if from_type == "float" and to_type == "double":
-            self.emit(f"cvtss2sd xmm0, xmm0")
-            self.emit(f"movaps {dest}, xmm0")
-            return
-        elif from_type == "double" and to_type == "float":
-            self.emit(f"cvtsd2ss xmm0, xmm0")
-            self.emit(f"movaps {dest}, xmm0")
-            return
-
-        # Fallback: just mov
-        self.emit(f"mov {dest}, {src}")
