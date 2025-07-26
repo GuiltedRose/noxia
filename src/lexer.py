@@ -4,7 +4,8 @@ KEYWORDS = {
 }
 
 TYPES = {
-    "int", "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64", "string", "bool", "void", "ptr", "float", "class", "error", "char", "&mut", "!safe"
+    "int", "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64",
+    "string", "bool", "void", "ptr", "float", "class", "error", "char", "&mut", "!safe"
 }
 
 SYMBOLS = {
@@ -76,7 +77,6 @@ class Lexer:
                     self.add_token("KEYWORD", value, start_line, start_col)
                 else:
                     self.add_token("IDENT", value, start_line, start_col)
-
 
             # Number or Float
             elif c.isdigit():
@@ -184,5 +184,7 @@ class Lexer:
             # Anything else = error
             else:
                 self.add_token("ERROR", f"Unexpected character '{c}'", self.line, self.col - 1)
+
+        self.add_token("EOF", "", self.line, self.col)
 
         return self.tokens
