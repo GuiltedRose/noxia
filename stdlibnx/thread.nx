@@ -1,4 +1,4 @@
-import "./stdlibnx/sys"
+import "stdlibnx/sys"
 
 fn thread_trampoline(func: ptr, arg: ptr) -> void {
     let f = cast(func as fn(arg: ptr) -> int)

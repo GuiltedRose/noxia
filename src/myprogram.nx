@@ -1,4 +1,4 @@
-import "/home/zelda/repos/noxia/stdlibnx/print"
+import "stdlibnx/print"
 
 fn _start() -> void {
     puts("Hello from Noxia!")

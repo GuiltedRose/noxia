@@ -1,5 +1,5 @@
-import "./stdlibnx/memory"
-import "./stdlibnx/string"
+import "stdlibnx/memory"
+import "stdlibnx/string"
 
 fn puts(msg: ptr) -> void {
   let len = strlen(msg)

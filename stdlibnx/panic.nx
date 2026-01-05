@@ -1,5 +1,5 @@
-import "./stdlibnx/sys"
-import "./stdlibnx/print"
+import "stdlibnx/sys"
+import "stdlibnx/print"
 
 fn panic(msg: ptr) -> void {
   puts(msg)

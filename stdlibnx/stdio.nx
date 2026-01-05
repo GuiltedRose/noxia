@@ -1,4 +1,4 @@
-import "./stdlibnx/sys"
+import "stdlibnx/sys"
 
 fn open(path: ptr, flags: int, mode: int) -> int {
   return syscall(2, path, flags, mode)

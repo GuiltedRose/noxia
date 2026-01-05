@@ -1,4 +1,4 @@
-import "./stdlibnx/sys"
+import "stdlibnx/sys"
 
 fn sbrk(len: int) -> ptr {
     static curr: ptr = 0

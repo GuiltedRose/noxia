@@ -1,6 +1,6 @@
 fn memset(dest: ptr, val: int, len: int) -> void {
     let p = cast(dest as *byte)
-    for let i = 0; i < len; i = i + 1 {
+    for let i = 0, i < len, i = i + 1 {
         p[i] = val
     }
 }
@@ -39,4 +39,3 @@ fn strcpy(dest: ptr, src: ptr) -> ptr {
   d[i] = 0
   return dest
 }
-

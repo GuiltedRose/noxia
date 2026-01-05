@@ -1,5 +1,5 @@
-import "./stdlibnx/alloc"
-import "./stdlibnx/string"
+import "stdlibnx/alloc"
+import "stdlibnx/string"
 
 const HEADER_SIZE = 8
 global last_alloc: ptr = 0
