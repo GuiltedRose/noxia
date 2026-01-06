@@ -10,12 +10,8 @@ class CodeGenerator:
         # ✅ System V AMD64 integer arg registers
         # arg0..arg5 map to rdi,rsi,rdx,rcx,r8,r9
         self.fixed_map = {
-            "arg0": "rdi",
-            "arg1": "rsi",
-            "arg2": "rdx",
-            "arg3": "rcx",
-            "arg4": "r8",
-            "arg5": "r9",
+            "arg0": "rdi", "arg1": "rsi", "arg2": "rdx",
+            "arg3": "rcx", "arg4": "r8",  "arg5": "r9",
             "ret": "rax",
         }
 
@@ -152,7 +148,6 @@ class CodeGenerator:
         self.emit(f"jmp near {label}")
 
     def jcc_near(self, cc: str, label: str):
-        # cc like "e", "ne", "l", "le", "g", "ge"
         self.emit(f"j{cc} near {label}")
 
     # ----------------------------
@@ -209,7 +204,6 @@ class CodeGenerator:
 
         name = func["name"]
 
-        # avoid duplicate globals
         if name not in self._globals_emitted:
             self.emit(f"global {name}")
             self._globals_emitted.add(name)
@@ -285,23 +279,36 @@ class CodeGenerator:
             self.store(instr["dest"], tmp)
             return
 
-        # load/store index (still qword*8 for now)
+        # ----------------------------
+        # ✅ FIXED: byte indexing (scale 1) for strings / *byte-style pointers
+        # ----------------------------
         if op == "load_index":
-            base = self.load(instr["base"], self.tmp1)
-            idx  = self.load(instr["index"], self.tmp2)
+            base = self.load(instr["base"], self.tmp1)     # r11 = base ptr
+            idx  = self.load(instr["index"], self.tmp2)    # r10 = idx
             if idx != "rcx":
                 self.emit(f"mov rcx, {idx}")
-            self.emit(f"mov {self.tmp1}, qword [{base} + rcx*8]")
+
+            # read a byte, zero-extend to 64-bit
+            self.emit(f"movzx {self.tmp1}, byte [{base} + rcx]")
             self.store(instr["dest"], self.tmp1)
             return
 
         if op == "store_index":
-            base = self.load(instr["base"], self.tmp1)
-            idx  = self.load(instr["index"], self.tmp2)
-            val  = self.load(instr["value"], self.tmp2)
+            base = self.load(instr["base"], self.tmp1)     # r11 = base ptr
+            idx  = self.load(instr["index"], self.tmp2)    # r10 = idx
             if idx != "rcx":
                 self.emit(f"mov rcx, {idx}")
-            self.emit(f"mov qword [{base} + rcx*8], {val}")
+
+            # now load value AFTER idx is in rcx (avoid clobber)
+            val = self.load(instr["value"], self.tmp2)     # r10 = val
+            v8 = self.low8_map.get(val, None)
+            if v8 is None:
+                # if val isn't a phys reg (rare), force into tmp2 then use tmp2b
+                if val != self.tmp2:
+                    self.emit(f"mov {self.tmp2}, {val}")
+                v8 = self.low8_map[self.tmp2]
+
+            self.emit(f"mov byte [{base} + rcx], {v8}")
             return
 
         # arithmetic / bitwise
@@ -360,7 +367,6 @@ class CodeGenerator:
                     "<":"l", "<=":"le",
                     ">":"g", ">=":"ge",
                 }[op]
-                # ✅ force near to avoid "label changed during code generation"
                 self.jcc_near(cc, instr["label"])
                 return
 
@@ -380,7 +386,6 @@ class CodeGenerator:
             return
 
         if op == "jmp":
-            # ✅ force near
             self.jmp_near(instr["label"])
             return
 
@@ -388,7 +393,6 @@ class CodeGenerator:
             a = self.load(instr["src1"], self.tmp1)
             b = self.load(instr["src2"], self.tmp2)
             self.emit(f"cmp {a}, {b}")
-            # ✅ force near
             self.jcc_near("e", instr["label"])
             return
 

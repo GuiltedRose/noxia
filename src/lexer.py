@@ -137,17 +137,46 @@ class Lexer:
                 continue
 
             # ---- string literal ----
+            # ---- string literal ----
             if c == '"':
-                value = ''
+                value = ""
                 start_line, start_col = self.line, self.col - 1
+
+                escape_map = {
+                    "n": "\n",
+                    "r": "\r",
+                    "t": "\t",
+                    "0": "\0",
+                    '"': '"',
+                    "\\": "\\",
+                }
+
                 while self.peek() is not None and self.peek() != '"':
-                    value += self.advance()
+                    ch = self.advance()
+
+                    if ch == "\\":  # escape sequence
+                        if self.peek() is None:
+                            self.add_token("ERROR", "Unterminated escape in string literal", start_line, start_col)
+                            break
+
+                        esc = self.advance()
+                        if esc not in escape_map:
+                            self.add_token("ERROR", f"Unknown escape \\{esc}", start_line, start_col)
+                            # Either treat it literally or continue; pick one:
+                            value += esc  # literal fallback
+                        else:
+                            value += escape_map[esc]
+                    else:
+                        value += ch
+
                 if self.peek() != '"':
                     self.add_token("ERROR", "Unterminated string literal", start_line, start_col)
                     continue
-                self.advance()
+
+                self.advance()  # closing quote
                 self.add_token("STRING", value, start_line, start_col)
                 continue
+
 
             # ---- char literal ----
             if c == "'":

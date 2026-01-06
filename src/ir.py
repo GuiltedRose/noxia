@@ -1,3 +1,6 @@
+import re
+
+
 class IRBuilder:
     def __init__(self):
         self.instructions = []
@@ -169,9 +172,14 @@ class IRBuilder:
 
             if isinstance(ref, str) and ref.startswith("global:"):
                 self.emit({"op": "gstore", "name": name, "value": rhs})
-            else:
-                self.symbol_table[name] = rhs
-            return rhs
+                return rhs
+
+            if ref is None:
+                raise Exception(f"[IRBuilderError] Assign to unknown variable '{name}'")
+
+            # ✅ FIX: do not rebind; write into stable slot
+            self.emit({"op": "mov", "dest": ref, "src": rhs})
+            return ref
 
         # assignment to index: a[i] = rhs
         if isinstance(target, dict) and target.get("type") == "IndexExpr":
@@ -274,12 +282,19 @@ class IRBuilder:
     # ----------------------------
     def compile_LetStatement(self, node):
         expr_node = node.get("value", node.get("init"))
-        dest = self.compile_expr(expr_node)
-        self.symbol_table[node["name"]] = dest
+        rhs = self.compile_expr(expr_node)
+
+        # ✅ FIX: allocate a stable slot for the variable and store into it
+        slot = self.new_reg()
+        self.emit({"op": "mov", "dest": slot, "src": rhs})
+        self.symbol_table[node["name"]] = slot
 
     def compile_StaticDecl(self, node):
-        dest = self.compile_expr(node["value"])
-        self.symbol_table[node["name"]] = dest
+        # Static decl behaves like a local slot too (unless you want to force it global later)
+        rhs = self.compile_expr(node["value"])
+        slot = self.new_reg()
+        self.emit({"op": "mov", "dest": slot, "src": rhs})
+        self.symbol_table[node["name"]] = slot
 
     def compile_ForStatement(self, node):
         init = node.get("init")
@@ -367,11 +382,15 @@ class IRBuilder:
         if node["name"] == "_start":
             node["params"] = []
 
+        # Keep params metadata as argN, but immediately spill each argN into a stable slot
         param_regs = []
         for i, param in enumerate(node["params"]):
-            reg = f"arg{i}"
-            self.symbol_table[param["name"]] = reg
-            param_regs.append(reg)
+            arg = f"arg{i}"
+            param_regs.append(arg)
+
+            slot = self.new_reg()
+            self.emit({"op": "mov", "dest": slot, "src": arg})
+            self.symbol_table[param["name"]] = slot
 
         self.compile_block(node["body"])
 
@@ -441,15 +460,12 @@ class IRBuilder:
         arm_labels = [self.new_label("arm") for _ in arms]
         nomatch_label = self.new_label("nomatch")
 
-        # Compare chain first
         for i, arm in enumerate(arms):
             pattern_reg = self.compile_expr(arm["pattern"])
             self.emit({"op": "jeq", "src1": match_reg, "src2": pattern_reg, "label": arm_labels[i]})
 
-        # If nothing matched, skip all arms
         self.emit({"op": "jmp", "label": nomatch_label})
 
-        # Arm bodies
         for i, arm in enumerate(arms):
             self.emit({"op": "label", "name": arm_labels[i]})
             self.compile_block(arm["body"])
@@ -490,16 +506,13 @@ class IRBuilder:
     def compile_GlobalDecl(self, node):
         name = node["name"]
 
-        # For .data globals, require constant init for now
         folded = self.try_eval_const(node["value"])
         if folded is None:
             raise Exception(f"[IRBuilderError] Global '{name}' initializer must be a constant for now")
 
-        # Record symbol as global memory ref
         self.symbol_table[name] = f"global:{name}"
         self.global_symbols[name] = f"global:{name}"
 
-        # Emit a Global IR record (not an rN temp)
         self.functions.append({
             "type": "Global",
             "name": name,

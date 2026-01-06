@@ -1,6 +1,8 @@
 import "stdlibnx/print"
 
+// This should not error
+/* This should not error */ // highlighting issue!!!! Pure visual bug...
 fn _start() -> void {
-    puts("Hello from Noxia!")
+    puts("Hello from Noxia!\n")
     sys_exit(0)
 }
