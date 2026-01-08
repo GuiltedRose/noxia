@@ -1,5 +1,4 @@
-# codegen.py (master)
-
+# codegen.py (master) - ABI-safe temps + correct prologue/epilogue + _start safety
 import re
 
 class CodeGenerator:
@@ -23,13 +22,16 @@ class CodeGenerator:
             "r12": "r12b","r13": "r13b","r14": "r14b","r15": "r15b",
         }
 
-        self.tmp1 = "r11"
-        self.tmp2 = "r10"
+        # ------------------------------------------------------------
+        # ABI FIX: use callee-saved temps so calls don't clobber them
+        # ------------------------------------------------------------
+        self.tmp1 = "r12"
+        self.tmp2 = "r13"
 
         self.slot_map = {}
         self.stack_size = 0
 
-        # ✅ fixed-size allocas reserved in the frame
+        # fixed-size allocas reserved in the frame
         self.alloca_map = {}   # dest_vreg -> stack offset (bytes below rbp)
 
         self._globals_emitted = set()
@@ -40,11 +42,14 @@ class CodeGenerator:
         self._defined_bss_globals = set()
         self._defined_text_globals = set()
 
-        # globals that must be treated as ADDRESSABLE OBJECTS (struct base / array base)
+        # globals treated as ADDRESSABLE OBJECTS (struct/array base)
         self._addr_globals = set()
 
         # current function label prefix for IR labels
         self._fn_prefix = ""
+
+        # current function name (for _start special-case)
+        self._cur_func = ""
 
     def emit(self, line):
         self.output.append(line)
@@ -64,7 +69,7 @@ class CodeGenerator:
     def global_name(self, x: str) -> str:
         return x.split(":", 1)[1]
 
-    # ✅ address-of global form: addr_global:NAME
+    # address-of global form: addr_global:NAME
     def is_addr_global(self, x) -> bool:
         return isinstance(x, str) and x.startswith("addr_global:")
 
@@ -124,7 +129,7 @@ class CodeGenerator:
             self.emit(f"mov {into_reg}, {value}")
             return into_reg
 
-        # ✅ address-of global: always lea
+        # address-of global: always lea
         if self.is_addr_global(value):
             sym = self.addr_global_name(value)
             self._used_globals.add(sym)
@@ -140,9 +145,6 @@ class CodeGenerator:
         if self.is_global_ref(value):
             sym = self.global_name(value)
             self._used_globals.add(sym)
-
-            # KEY RULE:
-            # If a global is used as a base pointer for field/index ops, treat it as an object => address.
             if sym in self._addr_globals or sym in self._defined_bss_globals:
                 self.emit(f"lea {into_reg}, [rel {sym}]")
             else:
@@ -195,7 +197,6 @@ class CodeGenerator:
     # ----------------------------
     def scan_addr_globals(self, funcs_ir):
         self._addr_globals = set()
-        # include ptr-index ops too (argv-like bases etc)
         base_ops = {
             "load_field", "store_field",
             "load_index", "store_index",
@@ -227,6 +228,7 @@ class CodeGenerator:
         self._defined_bss_globals = set()
         self._defined_text_globals = set()
         self._fn_prefix = ""
+        self._cur_func = ""
 
         globals_ir = []
         funcs_ir = []
@@ -239,14 +241,11 @@ class CodeGenerator:
             elif item.get("type") == "Function":
                 funcs_ir.append(item)
 
-        # function symbols
         for f in funcs_ir:
             self._defined_text_globals.add(f["name"])
 
-        # pre-scan to detect Buffer-like objects
         self.scan_addr_globals(funcs_ir)
 
-        # Emit .data for scalar globals only; emit .bss for address-globals
         data_lines = []
         bss_lines = []
 
@@ -257,7 +256,6 @@ class CodeGenerator:
                 init = int(init)
 
             if name in self._addr_globals:
-                # Treat as zeroed object storage (bootstrap-safe)
                 self._defined_bss_globals.add(name)
                 bss_lines.append(f"{name}: resb 256")
                 continue
@@ -278,7 +276,6 @@ class CodeGenerator:
         for func in funcs_ir:
             self.generate_function(func)
 
-        # unresolved globals => bss placeholders
         unresolved = sorted(
             (self._used_globals - self._defined_data_globals - self._defined_bss_globals) - self._defined_text_globals
         )
@@ -300,12 +297,26 @@ class CodeGenerator:
 
         return "\n".join(self.output)
 
+    # ----------------------------
+    # Function epilogue
+    # ----------------------------
+    def emit_epilogue_and_ret(self):
+        # unwind locals first
+        if self.stack_size:
+            self.emit(f"add rsp, {self.stack_size}")
+        # then restore frame + saved regs (reverse of prologue pushes)
+        self.emit("pop rbp")
+        self.emit("pop r13")
+        self.emit("pop r12")
+        self.emit("ret")
+
     def generate_function(self, func):
         self.slot_map = {}
         self.stack_size = 0
-        self.alloca_map = {}   # ✅ reset per-function
+        self.alloca_map = {}
 
         name = func["name"]
+        self._cur_func = name
         self._fn_prefix = f"fn_{name}__"
 
         if name not in self._globals_emitted:
@@ -313,22 +324,23 @@ class CodeGenerator:
             self._globals_emitted.add(name)
 
         self.emit(f"{name}:")
+
+        # ------------------------------------------------------------
+        # Prologue (order matters!)
+        # Save callee-saved temps BEFORE establishing rbp,
+        # so rbp-based argument offsets can be correct & stable.
+        # ------------------------------------------------------------
+        self.emit("push r12")
+        self.emit("push r13")
         self.emit("push rbp")
         self.emit("mov rbp, rsp")
 
-        # ✅ ENTRY ABI FIX FOR _start (argc/argv come from initial stack)
-        # Kernel stack on entry (before we touch it):
-        #   [rsp + 0]  = argc
-        #   [rsp + 8]  = argv[0]
-        #   ...
-        # After push rbp / mov rbp,rsp:
-        #   [rbp + 8]  = argc
-        #   [rbp + 16] = argv[0]
-        #
-        # We map them into normal ABI registers so IR can use arg0/arg1.
+        # _start entry mapping:
+        # After pushes above, rbp points at saved rbp.
+        # [rbp+24] = argc, [rbp+32] = argv[0]
         if name == "_start":
-            self.emit("mov rdi, qword [rbp + 8]")   # argc
-            self.emit("lea rsi, [rbp + 16]")        # argv as &argv[0]
+            self.emit("mov rdi, qword [rbp + 24]")   # argc
+            self.emit("lea rsi, [rbp + 32]")        # argv as &argv[0]
             self.emit("")
 
         body = func.get("body", [])
@@ -355,7 +367,15 @@ class CodeGenerator:
                 self.stack_size += size_aligned
                 self.alloca_map[dest] = self.stack_size
 
-        # Align stack frame to 16 bytes
+        # ------------------------------------------------------------
+        # SysV ABI: stack alignment
+        # Goal: BEFORE any 'call', RSP % 16 == 8.
+        # With our prologue (3 pushes = 24 bytes), we are at:
+        #   entry rsp%16 == 8  (true at process entry and for normal calls)
+        #   after 24 bytes push => still 8
+        # So we must choose locals size so rsp%16 remains 8.
+        # That means stack_size % 16 must be 0.
+        # ------------------------------------------------------------
         frame = self.stack_size
         rem = frame % 16
         if rem != 0:
@@ -368,13 +388,19 @@ class CodeGenerator:
         for instr in body:
             self.generate_instr(instr)
 
+        # If no explicit ret, emit fallback.
+        # _start must never return: call sys_exit(0) then ud2.
         if not body or body[-1].get("op") != "ret":
-            self.emit("mov rsp, rbp")
-            self.emit("pop rbp")
-            self.emit("ret")
+            if name == "_start":
+                self.emit("mov rdi, 0")
+                self.emit("call sys_exit")
+                self.emit("ud2")
+            else:
+                self.emit_epilogue_and_ret()
 
         self.emit("")
         self._fn_prefix = ""
+        self._cur_func = ""
 
     # ----------------------------
     # Instruction selection
@@ -435,8 +461,6 @@ class CodeGenerator:
         # ----------------------------
         # Indexing ops
         # ----------------------------
-
-        # byte indexing: *(base + idx) as unsigned byte
         if op == "load_index":
             base = self.load(instr["base"], self.tmp1)
             idx  = self.load(instr["index"], self.tmp2)
@@ -446,8 +470,6 @@ class CodeGenerator:
             self.store(instr["dest"], self.tmp1)
             return
 
-        # ✅ pointer indexing: *(base + idx*8) as qword
-        # Used for argv[i] where argv is &argv[0] (ptr* / char**)
         if op == "load_ptr_index":
             base = self.load(instr["base"], self.tmp1)
             idx  = self.load(instr["index"], self.tmp2)
@@ -471,7 +493,6 @@ class CodeGenerator:
             self.emit(f"mov byte [{base} + rcx], {v8}")
             return
 
-        # (not currently used, but here for symmetry)
         if op == "store_ptr_index":
             base = self.load(instr["base"], self.tmp1)
             idx  = self.load(instr["index"], self.tmp2)
@@ -484,7 +505,6 @@ class CodeGenerator:
         # ----------------------------
         # Struct field ops
         # ----------------------------
-
         if op == "load_field":
             base = self.load(instr["base"], self.tmp1)
             off = instr.get("offset", 0)
@@ -516,7 +536,6 @@ class CodeGenerator:
         # ----------------------------
         # ALU ops
         # ----------------------------
-
         if op in ("add", "sub", "mul", "&", "|", "^"):
             a = self.load(instr["src1"], self.tmp1)
             b = self.load(instr["src2"], self.tmp2)
@@ -587,7 +606,6 @@ class CodeGenerator:
         # ----------------------------
         # CFG / calls / misc
         # ----------------------------
-
         if op == "label":
             self.emit(f"{self.mangle_label(instr['name'])}:")
             return
@@ -626,11 +644,20 @@ class CodeGenerator:
 
         if op == "ret":
             v = instr.get("value")
+
+            # _start must never return.
+            if self._cur_func == "_start":
+                if v is not None:
+                    self.load(v, "rdi")
+                else:
+                    self.emit("mov rdi, 0")
+                self.emit("call sys_exit")
+                self.emit("ud2")
+                return
+
             if v is not None:
                 self.load(v, "rax")
-            self.emit("mov rsp, rbp")
-            self.emit("pop rbp")
-            self.emit("ret")
+            self.emit_epilogue_and_ret()
             return
 
         if op == "cast":

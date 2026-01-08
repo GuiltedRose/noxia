@@ -1,6 +1,5 @@
-import "stdlibnx/memory" // for malloc/free
-import "stdlibnx/string" // for memcpy
-// HEADER_SIZE is 8 in your memory.nx
+import "stdlibnx/memory"   // malloc/free + Header + HEADER_SIZE
+import "stdlibnx/string"   // memcpy
 
 fn realloc(p: ptr, new_size: int) -> ptr {
     if p == 0 {
@@ -11,11 +10,13 @@ fn realloc(p: ptr, new_size: int) -> ptr {
         return 0
     }
 
-    // old size lives in header
+    // read old size from header (qword-safe via load_field)
     let meta_ptr = p - HEADER_SIZE
-    let old_size = cast(meta_ptr as *int)[0]
+    let h = cast(meta_ptr as *Header)
+    let old_size = h.size
 
     let newp = malloc(new_size)
+    if newp == 0 { return 0 }
 
     let copy_len = old_size
     if new_size < copy_len {
@@ -23,9 +24,6 @@ fn realloc(p: ptr, new_size: int) -> ptr {
     }
 
     memcpy(newp, p, copy_len)
-
-    // free may or may not reclaim depending on last_alloc; that's fine
     free(p)
-
     return newp
 }

@@ -1,4 +1,4 @@
-# ir.py (master)
+# ir.py (master) — FIXED struct inference for MemberExpr/store_field
 
 class IRBuilder:
     def __init__(self, debug: bool = False):
@@ -10,20 +10,21 @@ class IRBuilder:
 
         self.symbol_table = {}
         self.global_symbols = {}
-        self.extern_symbols = set()   # track auto-externs
+        self.extern_symbols = set()
         self.in_function = False
         self.functions = []
 
-        # loop end-label stack for break
         self.loop_end_stack = []
 
         # Minimal struct layout info
         self.structs = {}
 
-        # ✅ Track locals that were auto-allocated as struct storage.
-        # For these, the variable already holds an ADDRESS (a pointer).
-        # So "&var" must return var (not the address of the pointer slot).
+        # Track locals that were auto-allocated as struct storage (var holds ADDRESS)
         self.struct_local_ptrs = set()
+
+        # ✅ NEW: track declared/static types for inference
+        self.var_types = {}   # name -> type_str
+        self.reg_types = {}   # reg -> type_str
 
         self.type_sizes = {
             "byte": 1,
@@ -53,7 +54,6 @@ class IRBuilder:
     # Build / Top-level
     # ----------------------------
     def build(self, ast):
-        # reset outputs for a fresh build
         self.instructions = []
         self.register_count = 0
         self.label_count = 0
@@ -64,7 +64,11 @@ class IRBuilder:
         self.functions = []
         self.loop_end_stack = []
         self.structs = {}
-        self.struct_local_ptrs = set()   # ✅ reset
+        self.struct_local_ptrs = set()
+
+        # ✅ reset type tracking
+        self.var_types = {}
+        self.reg_types = {}
 
         # Pass 1: gather struct layouts so MemberExpr works
         for node in ast:
@@ -97,7 +101,6 @@ class IRBuilder:
     # Struct layout
     # ----------------------------
     def sizeof(self, t):
-        # Returns byte-size of a type string
         if not isinstance(t, str):
             return 8
         if t.startswith("*") or t.startswith("&"):
@@ -115,7 +118,6 @@ class IRBuilder:
             fname = f.get("name")
             ftype = f.get("type")
             if isinstance(ftype, dict):
-                # e.g. {"type":"Type","name":"int"}
                 ftype = ftype.get("name") if isinstance(ftype, dict) else str(ftype)
             if not isinstance(ftype, str):
                 ftype = str(ftype)
@@ -125,8 +127,6 @@ class IRBuilder:
             off += self.sizeof(ftype)
 
         self.structs[name] = {"fields": fields, "offsets": offsets, "size": off}
-
-        # Make `sizeof(structname)` work via type_sizes too (handy for debugging)
         self.type_sizes[name] = off
 
     def field_offset(self, struct_name, field_name):
@@ -152,6 +152,42 @@ class IRBuilder:
             mem = node.get("name")
 
         return obj, mem
+
+    # ----------------------------
+    # Type helpers (NEW)
+    # ----------------------------
+    def format_type(self, t):
+        if isinstance(t, str):
+            return t
+        if isinstance(t, dict) and t.get("type") == "Type":
+            return t.get("name")
+        if isinstance(t, dict) and "name" in t:
+            return t.get("name")
+        return str(t)
+
+    def _strip_ptrs(self, t: str):
+        # strip leading pointer/ref markers: **Header -> Header
+        if not isinstance(t, str):
+            return None
+        while t.startswith("*") or t.startswith("&"):
+            t = t[1:]
+        return t
+
+    def _as_struct_name(self, t: str):
+        if not t:
+            return None
+        base = self._strip_ptrs(t)
+        if base in self.structs:
+            return base
+        return None
+
+    def _reg_type(self, reg: str):
+        if not isinstance(reg, str):
+            return None
+        return self.reg_types.get(reg)
+
+    def _var_type(self, name: str):
+        return self.var_types.get(name)
 
     # ----------------------------
     # Const folding
@@ -221,9 +257,6 @@ class IRBuilder:
         return None
 
     def compile_ConstDecl(self, node):
-        """
-        Bootstrap rule: const MUST fold (no top-level IR).
-        """
         name = node["name"]
         value_node = node["value"]
 
@@ -234,7 +267,6 @@ class IRBuilder:
         entry = ("const", folded)
         self.symbol_table[name] = entry
         if not self.in_function:
-            # overwrite any extern placeholder
             self.global_symbols[name] = entry
             self.extern_symbols.discard(name)
 
@@ -243,8 +275,7 @@ class IRBuilder:
     # ----------------------------
     def declare_extern(self, name: str):
         if name in self.global_symbols:
-            return  # already known (const/global/etc)
-        # IMPORTANT: don't extern a struct type name
+            return
         if name in self.structs:
             return
         self.global_symbols[name] = f"global:{name}"
@@ -257,25 +288,28 @@ class IRBuilder:
     def compile_Literal(self, node):
         reg = self.new_reg()
         self.emit({"op": "const", "dest": reg, "value": node["value"]})
+        self.reg_types.pop(reg, None)
         return reg
 
     def compile_NullLiteral(self, node):
         reg = self.new_reg()
         self.emit({"op": "const", "dest": reg, "value": 0})
+        self.reg_types.pop(reg, None)
         return reg
 
     def compile_Error(self, node):
         reg = self.new_reg()
         self.emit({"op": "const", "dest": reg, "value": 0})
+        self.reg_types.pop(reg, None)
         return reg
 
     def compile_Variable(self, node):
         name = node["name"]
 
-        # FIX: referencing a struct type name as a value => sizeof(Struct)
         if name in self.structs:
             reg = self.new_reg()
             self.emit({"op": "const", "dest": reg, "value": int(self.structs[name]["size"])})
+            self.reg_types.pop(reg, None)
             return reg
 
         if name in self.symbol_table:
@@ -284,44 +318,40 @@ class IRBuilder:
             if isinstance(ref, tuple) and ref[0] == "const":
                 reg = self.new_reg()
                 self.emit({"op": "const", "dest": reg, "value": ref[1]})
+                self.reg_types.pop(reg, None)
                 return reg
+
+            # propagate type if local slot
+            if isinstance(ref, str) and ref.startswith("r"):
+                t = self.var_types.get(name)
+                if t:
+                    self.reg_types[ref] = t
 
             if isinstance(ref, str) and ref.startswith("global:"):
                 return ref
 
             return ref
 
-        # Bootstrap/linker-friendly behavior:
-        # If a variable isn’t in scope, treat it as an extern global symbol.
         self.declare_extern(name)
         self.symbol_table[name] = f"global:{name}"
         return f"global:{name}"
 
     def compile_IndexExpr(self, node):
-        """
-        Bootstrap typing hack:
-
-        - argv is an array of pointers (ptr* / char** conceptually).
-          So argv[i] must load a qword pointer at base + i*8.
-
-        - Everything else continues to use byte indexing for now
-          (strings/buffers).
-        """
         tgt = node.get("target")
 
-        # ✅ Special-case argv[index] => pointer indexing
         if isinstance(tgt, dict) and tgt.get("type") == "Variable" and tgt.get("name") == "argv":
             base_reg = self.compile_expr(tgt)
             idx_reg = self.compile_expr(node["index"])
             dest = self.new_reg()
             self.emit({"op": "load_ptr_index", "dest": dest, "base": base_reg, "index": idx_reg})
+            self.reg_types.pop(dest, None)
             return dest
 
-        # Default: byte indexing
         base_reg = self.compile_expr(node["target"])
         idx_reg = self.compile_expr(node["index"])
         dest = self.new_reg()
         self.emit({"op": "load_index", "dest": dest, "base": base_reg, "index": idx_reg})
+        self.reg_types.pop(dest, None)
         return dest
 
     def compile_MemberExpr(self, node):
@@ -345,6 +375,20 @@ class IRBuilder:
 
         dest = self.new_reg()
         self.emit({"op": "load_field", "dest": dest, "base": base_ptr, "offset": off})
+
+        # best-effort: set result type to field type if known
+        field_t = None
+        s = self.structs.get(struct_name)
+        if s:
+            for (fn, ft) in s["fields"]:
+                if fn == member:
+                    field_t = ft
+                    break
+        if field_t:
+            self.reg_types[dest] = field_t
+        else:
+            self.reg_types.pop(dest, None)
+
         return dest
 
     def compile_AssignExpr(self, node):
@@ -366,6 +410,9 @@ class IRBuilder:
                 return rhs
 
             self.emit({"op": "mov", "dest": ref, "src": rhs})
+            # keep type on slot if known
+            if name in self.var_types:
+                self.reg_types[ref] = self.var_types[name]
             return ref
 
         if isinstance(target, dict) and target.get("type") == "IndexExpr":
@@ -403,6 +450,7 @@ class IRBuilder:
         if folded is not None:
             reg = self.new_reg()
             self.emit({"op": "const", "dest": reg, "value": folded})
+            self.reg_types.pop(reg, None)
             return reg
 
         op = node["op"]
@@ -413,12 +461,15 @@ class IRBuilder:
 
             l_bool = self.new_reg()
             self.emit({"op": "ne", "dest": l_bool, "src1": left, "src2": "0"})
+            self.reg_types[l_bool] = "bool"
 
             r_bool = self.new_reg()
             self.emit({"op": "ne", "dest": r_bool, "src1": right, "src2": "0"})
+            self.reg_types[r_bool] = "bool"
 
             dest = self.new_reg()
             self.emit({"op": "and" if op == "&&" else "or", "dest": dest, "src1": l_bool, "src2": r_bool})
+            self.reg_types[dest] = "bool"
             return dest
 
         left = self.compile_expr(node["left"])
@@ -436,23 +487,27 @@ class IRBuilder:
             raise Exception(f"[IRBuilderError] Unsupported binary op: {op}")
 
         self.emit({"op": ir_op, "dest": dest, "src1": left, "src2": right})
+
+        # best-effort typing
+        if ir_op in ("eq", "ne", "lt", "le", "gt", "ge"):
+            self.reg_types[dest] = "bool"
+        else:
+            # inherit integer-ish types if we have them
+            self.reg_types[dest] = self._reg_type(left) or self._reg_type(right) or "int"
+
         return dest
 
     def compile_UnaryExpr(self, node):
         op = node.get("op")
         expr = node.get("expr")
 
-        # FIX: "&x" should produce an address
         if op == "&":
             if isinstance(expr, dict) and expr.get("type") == "Variable":
                 name = expr.get("name")
 
-                # ✅ If we auto-allocated a struct local, the var already holds an address.
-                # So "&var" must just be "var" (avoid creating Buffer**).
                 if name in self.struct_local_ptrs:
                     return self.compile_Variable(expr)
 
-                # Global -> addressable global marker
                 if (
                     name in self.global_symbols or
                     (name in self.symbol_table and isinstance(self.symbol_table[name], str) and self.symbol_table[name].startswith("global:"))
@@ -460,18 +515,19 @@ class IRBuilder:
                     return f"addr_global:{name}"
 
                 ref = self.symbol_table.get(name)
-
-                # Local slot -> addr_local
                 if isinstance(ref, str) and ref.startswith("r"):
                     out = self.new_reg()
                     self.emit({"op": "addr_local", "dest": out, "src": ref})
+                    # &T becomes *T if we know T
+                    vt = self.var_types.get(name)
+                    if vt:
+                        self.reg_types[out] = "*" + vt if not vt.startswith("*") else "*" + vt
                     return out
 
-            # fallback
             return self.compile_expr(expr)
 
-        # "*" in this bootstrap IR means "already a pointer expression"
         if op == "*":
+            # runtime load is handled later; in IR we treat *expr as “pointer expression”
             return self.compile_expr(expr)
 
         src = self.compile_expr(expr)
@@ -479,17 +535,20 @@ class IRBuilder:
 
         if op == "-":
             self.emit({"op": "neg", "dest": dest, "src": src})
+            self.reg_types[dest] = self._reg_type(src) or "int"
             return dest
 
         if op == "!":
             self.emit({"op": "eq", "dest": dest, "src1": src, "src2": "0"})
+            self.reg_types[dest] = "bool"
             return dest
 
-        # ✅ bitwise NOT: ~x  ==>  x xor -1
         if op == "~":
             mask = self.new_reg()
             self.emit({"op": "const", "dest": mask, "value": -1})
+            self.reg_types.pop(mask, None)
             self.emit({"op": "xor", "dest": dest, "src1": src, "src2": mask})
+            self.reg_types[dest] = self._reg_type(src) or "int"
             return dest
 
         raise Exception(f"[IRBuilderError] Unsupported unary op: {op}")
@@ -530,9 +589,6 @@ class IRBuilder:
     # Statements
     # ----------------------------
     def _declared_type_name(self, node):
-        """
-        Best-effort extract of a declared type name for LetStatement.
-        """
         for k in ("var_type", "decl_type", "annot", "annotation", "value_type"):
             if k in node:
                 t = node[k]
@@ -552,18 +608,22 @@ class IRBuilder:
 
         declared_t = self._declared_type_name(node)
 
-        # FIX: struct local with no initializer => allocate stack storage and bind var to pointer
+        # struct local with no initializer => allocate stack storage and bind var to pointer
         if expr_node is None and declared_t in self.structs:
             size = int(self.structs[declared_t]["size"])
             ptr = self.new_reg()
             self.emit({"op": "alloca", "dest": ptr, "size": size})
             self.symbol_table[node["name"]] = ptr
-            self.struct_local_ptrs.add(node["name"])   # ✅ mark as "already an address"
+            self.struct_local_ptrs.add(node["name"])
+            # ✅ type: variable holds address of struct
+            self.var_types[node["name"]] = declared_t
+            self.reg_types[ptr] = declared_t
             return
 
         if expr_node is None:
             rhs = self.new_reg()
             self.emit({"op": "const", "dest": rhs, "value": 0})
+            self.reg_types.pop(rhs, None)
         else:
             rhs = self.compile_expr(expr_node)
 
@@ -571,10 +631,20 @@ class IRBuilder:
         self.emit({"op": "mov", "dest": slot, "src": rhs})
         self.symbol_table[node["name"]] = slot
 
+        # ✅ record declared type if available
+        if declared_t:
+            self.var_types[node["name"]] = declared_t
+            self.reg_types[slot] = declared_t
+        else:
+            # fall back: inherit rhs type
+            rt = self._reg_type(rhs)
+            if rt:
+                self.var_types[node["name"]] = rt
+                self.reg_types[slot] = rt
+
     def compile_StaticDecl(self, node):
         name = node["name"]
 
-        # Top-level static: must be .data-friendly constant init (like GlobalDecl)
         if not self.in_function:
             folded = self.try_eval_const(node["value"])
             if folded is None:
@@ -688,11 +758,11 @@ class IRBuilder:
         self.register_count = 0
         self.in_function = True
         self.loop_end_stack = []
-        self.struct_local_ptrs = set()   # ✅ reset per-function locals
+        self.struct_local_ptrs = set()
+        self.reg_types = {}
+        # keep var_types across functions? safer to reset per fn locals but keep globals
+        fn_locals_types = {}
 
-        # NOTE: Do NOT strip params from _start.
-        # We need to support argc/argv for bootstrapping and for the linker.
-        # (Codegen handles pulling them from the entry stack.)
         param_regs = []
         for i, param in enumerate(node["params"]):
             arg = f"arg{i}"
@@ -701,6 +771,23 @@ class IRBuilder:
             slot = self.new_reg()
             self.emit({"op": "mov", "dest": slot, "src": arg})
             self.symbol_table[param["name"]] = slot
+
+            # ✅ capture param types if present
+            ptype = None
+            if isinstance(param, dict):
+                if "var_type" in param:
+                    ptype = self.format_type(param["var_type"])
+                elif "type" in param:
+                    ptype = self.format_type(param["type"])
+                elif "decl_type" in param:
+                    ptype = self.format_type(param["decl_type"])
+            if ptype:
+                fn_locals_types[param["name"]] = ptype
+                self.reg_types[slot] = ptype
+
+        # merge types
+        for k, v in fn_locals_types.items():
+            self.var_types[k] = v
 
         self.compile_block(node["body"])
 
@@ -728,6 +815,8 @@ class IRBuilder:
         else:
             self.emit({"op": "call", "func": callee_name, "args": args, "dest": dest})
 
+        # unknown return type
+        self.reg_types.pop(dest, None)
         return dest
 
     # ----------------------------
@@ -777,18 +866,14 @@ class IRBuilder:
     # ----------------------------
     # Cast / Unsafe
     # ----------------------------
-    def format_type(self, t):
-        if isinstance(t, str):
-            return t
-        if isinstance(t, dict) and t.get("type") == "Type":
-            return t["name"]
-        return str(t)
-
     def compile_CastExpr(self, node):
         src_reg = self.compile_expr(node["expr"])
         dest = self.new_reg()
         type_str = self.format_type(node["target_type"])
         self.emit({"op": "cast", "src": src_reg, "to": type_str, "dest": dest})
+        # ✅ record type for inference (critical for cast(raw as *Header))
+        if type_str:
+            self.reg_types[dest] = type_str
         return dest
 
     def compile_UnsafeBlockExpr(self, node):
@@ -817,11 +902,64 @@ class IRBuilder:
         self.functions.append({"type": "Global", "name": name, "init": folded})
 
     # ----------------------------
-    # Type inference helpers (bootstrap)
+    # Type inference (FIXED)
     # ----------------------------
     def infer_struct_name(self, expr):
-        if len(self.structs) == 1:
-            return next(iter(self.structs.keys()))
+        """
+        Return the underlying struct name for expressions like:
+          - Variable with declared type Header / *Header
+          - cast(x as *Header)
+          - *p where p is *Header
+        """
+        if expr is None or not isinstance(expr, dict):
+            return None
+
+        t = expr.get("type")
+
+        # Variable: consult var_types
+        if t == "Variable":
+            name = expr.get("name")
+            return self._as_struct_name(self._var_type(name))
+
+        # Cast: consult target_type
+        if t == "CastExpr":
+            ty = self.format_type(expr.get("target_type"))
+            return self._as_struct_name(ty)
+
+        # Unary: * and &
+        if t == "UnaryExpr":
+            op = expr.get("op")
+            inner = expr.get("expr")
+            inner_struct = self.infer_struct_name(inner)
+
+            if op == "*":
+                # if we know inner type is *Struct, unwrap it
+                if isinstance(inner, dict) and inner.get("type") == "Variable":
+                    vt = self._var_type(inner.get("name"))
+                    # *(*Header) -> Header
+                    s = self._as_struct_name(vt)
+                    if s:
+                        return s
+                if inner_struct:
+                    return inner_struct
+                # also try reg_types if inner compiled to a reg with type *Struct
+                reg = None
+                try:
+                    reg = self.compile_expr(inner)  # last resort; should be avoided
+                except Exception:
+                    reg = None
+                if isinstance(reg, str):
+                    return self._as_struct_name(self._reg_type(reg))
+
+            if op == "&":
+                return inner_struct
+
+        # MemberExpr: if you do (something).field and then .field2, etc.
+        if t == "MemberExpr":
+            obj, _ = self.member_parts(expr)
+            return self.infer_struct_name(obj)
+
+        # Default: unknown
         return None
 
 

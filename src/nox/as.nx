@@ -1,0 +1,260 @@
+import "stdlibnx/sys"
+import "stdlibnx/stdio"
+import "stdlibnx/memory"
+import "stdlibnx/string"
+import "stdlibnx/realloc"
+
+struct Buffer {
+    data: ptr
+    len: int
+    cap: int
+}
+
+fn buf_init(out: ptr) -> void {
+    let b = cast(out as *Buffer)
+    b.data = 0
+    b.len = 0
+    b.cap = 0
+}
+
+fn buf_grow(b: *Buffer, need: int) -> void {
+    if need <= b.cap { return }
+    let new_cap = b.cap
+    if new_cap == 0 { new_cap = 65536 }
+    while new_cap < need { new_cap = new_cap * 2 }
+    if b.data == 0 { b.data = malloc(new_cap) }
+    else { b.data = realloc(b.data, new_cap) }
+    if b.data == 0 { sys_exit(99) }
+    b.cap = new_cap
+}
+
+fn buf_push_u8(b: *Buffer, v: int) -> void {
+    let idx = b.len
+    let need = idx + 1
+    buf_grow(b, need)
+
+    // reload after call (works around caller-saved clobber bugs in codegen)
+    let p = b.data
+    let idx2 = b.len
+
+    p[idx2] = v & 255
+    b.len = idx2 + 1
+}
+
+fn buf_push_u64_le(b: *Buffer, v: int) -> void {
+    buf_push_u8(b, (v >> 0) & 255)
+    buf_push_u8(b, (v >> 8) & 255)
+    buf_push_u8(b, (v >> 16) & 255)
+    buf_push_u8(b, (v >> 24) & 255)
+    buf_push_u8(b, (v >> 32) & 255)
+    buf_push_u8(b, (v >> 40) & 255)
+    buf_push_u8(b, (v >> 48) & 255)
+    buf_push_u8(b, (v >> 56) & 255)
+}
+
+const O_RDONLY = 0
+const O_WRONLY = 1
+const O_CREAT  = 64
+const O_TRUNC  = 512
+const MODE_755 = 493
+
+fn read_file(out: ptr, path: ptr) -> int {
+    buf_init(out)
+    let b = cast(out as *Buffer)
+
+    let fd = open(path, O_RDONLY, 0)
+    if fd < 0 { return -1 }
+
+    let chunk = 4096
+    let tmpbuf = malloc(chunk)
+    if tmpbuf == 0 {
+        close(fd)
+        return -1
+    }
+
+    while 1 {
+        let n = read(fd, tmpbuf, chunk)
+        if n < 0 {
+            free(tmpbuf)
+            close(fd)
+            if b.data != 0 { free(b.data) }
+            buf_init(out)
+            return -1
+        }
+        if n == 0 { break }
+
+        let need = b.len + n
+        buf_grow(b, need)
+
+        // reload b.data after call too (same class of bug)
+        let dst = b.data + b.len
+
+        memcpy(dst, tmpbuf, n)
+        b.len = b.len + n
+    }
+
+    free(tmpbuf)
+    close(fd)
+    return 0
+}
+
+fn write_file(path: ptr, data: ptr, len: int) -> int {
+    let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, MODE_755)
+    if fd < 0 { return -1 }
+
+    let off = 0
+    while off < len {
+        let n = write(fd, data + off, len - off)
+        if n <= 0 {
+            close(fd)
+            return -1
+        }
+        off = off + n
+    }
+
+    close(fd)
+    return 0
+}
+
+fn emit_syscall(out: *Buffer) -> void {
+    buf_push_u8(out, 15)
+    buf_push_u8(out, 5)
+}
+
+fn emit_mov_rax_imm64(out: *Buffer, imm: int) -> void {
+    buf_push_u8(out, 72)
+    buf_push_u8(out, 184)
+    buf_push_u64_le(out, imm)
+}
+
+fn emit_mov_rdi_imm64(out: *Buffer, imm: int) -> void {
+    buf_push_u8(out, 72)
+    buf_push_u8(out, 191)
+    buf_push_u64_le(out, imm)
+}
+
+fn parse_int_dec(s: ptr) -> int {
+    let i = 0
+    let v = 0
+    while s[i] != 0 {
+        let c = s[i]
+        if c < 48 || c > 57 { break }
+        v = (v * 10) + (c - 48)
+        i = i + 1
+    }
+    return v
+}
+
+fn skip_ws(s: ptr, i: int) -> int {
+    let j = i
+    while s[j] == 32 || s[j] == 9 { j = j + 1 }
+    return j
+}
+
+fn assemble_text(out: *Buffer, src: *Buffer) -> int {
+    let i = 0
+    let p = src.data
+
+    while i < src.len {
+        if p[i] == 0 { break }
+
+        let line = p + i
+
+        let j = 0
+        while 1 {
+            if i + j >= src.len { return -1 }
+            if p[i + j] == 10 { break }
+            j = j + 1
+        }
+
+        let end = i + j
+
+        let saved = p[end]
+        p[end] = 0
+
+        let k = skip_ws(line, 0)
+
+        if line[k] == 0 {
+        } else {
+            if line[k] == 59 {
+            } else {
+                if line[k] == 35 {
+                } else {
+                    if line[k] == 115 {
+                        emit_syscall(out)
+                    } else {
+                        let t = k
+                        while 1 {
+                            if line[t] == 0 { break }
+                            if line[t] == 44 { break }
+                            t = t + 1
+                        }
+
+                        if line[t] != 44 {
+                            p[end] = saved
+                            return -1
+                        }
+
+                        t = t + 1
+                        t = skip_ws(line, t)
+                        let imm = parse_int_dec(line + t)
+
+                        let r0 = line[k + 4]
+                        let r1 = line[k + 5]
+                        let r2 = line[k + 6]
+
+                        if r0 == 114 {
+                            if r1 == 97 {
+                                if r2 == 120 {
+                                    emit_mov_rax_imm64(out, imm)
+                                } else {
+                                    p[end] = saved
+                                    return -1
+                                }
+                            } else {
+                                if r1 == 100 {
+                                    if r2 == 105 {
+                                        emit_mov_rdi_imm64(out, imm)
+                                    } else {
+                                        p[end] = saved
+                                        return -1
+                                    }
+                                } else {
+                                    p[end] = saved
+                                    return -1
+                                }
+                            }
+                        } else {
+                            p[end] = saved
+                            return -1
+                        }
+                    }
+                }
+            }
+        }
+
+        p[end] = saved
+        i = end + 1
+    }
+
+    return 0
+}
+
+fn _start(argc: int, argv: *ptr) -> void {
+    if argc < 2 { sys_exit(64) }
+
+    let src: Buffer
+    if read_file(&src, argv[1]) != 0 { sys_exit(1) }
+
+    buf_push_u8(&src, 10)
+    buf_push_u8(&src, 0)
+
+    let outb: Buffer
+    buf_init(&outb)
+
+    if assemble_text(&outb, &src) != 0 { sys_exit(2) }
+
+    if write_file("program.bin", outb.data, outb.len) != 0 { sys_exit(3) }
+
+    sys_exit(0)
+}

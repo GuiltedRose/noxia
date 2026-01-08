@@ -2,32 +2,48 @@ import "stdlibnx/alloc"
 import "stdlibnx/string"
 
 const HEADER_SIZE = 8
+
+struct Header {
+    size: int
+}
+
 global last_alloc: ptr = 0
 
 fn malloc(size: int) -> ptr {
+    if size <= 0 { return 0 }
+
     let total = size + HEADER_SIZE
     let raw = sbrk(total)
+    if raw == 0 { return 0 }
+
     last_alloc = raw + total
-    let meta = cast(raw as *int)
-    meta[0] = size
+
+    let h = cast(raw as *Header)
+    h.size = size
+
     return raw + HEADER_SIZE
 }
 
-fn free(ptr: ptr) -> void {
-    let meta_ptr = ptr - HEADER_SIZE
-    let size = cast(meta_ptr as *int)[0]
+fn free(p: ptr) -> void {
+    if p == 0 { return }
+
+    let meta_ptr = p - HEADER_SIZE
+    let h = cast(meta_ptr as *Header)
+    let size = h.size
+    if size <= 0 { return }
 
     let total = size + HEADER_SIZE
-    brk(meta_ptr)
 
+    // Only shrink the heap if this is the most recent allocation.
     if meta_ptr + total == last_alloc {
         brk(meta_ptr)
-        last_alloc = meta_ptr // step back
+        last_alloc = meta_ptr
     }
 }
 
 fn calloc(size: int) -> ptr {
-    let ptr = malloc(size)
-    memset(ptr, 0, size)
-    return ptr
+    let p = malloc(size)
+    if p == 0 { return 0 }
+    memset(p, 0, size)
+    return p
 }
