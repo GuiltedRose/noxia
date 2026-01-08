@@ -1,3 +1,5 @@
+# codegen.py (master)
+
 import re
 
 class CodeGenerator:
@@ -7,8 +9,7 @@ class CodeGenerator:
         self.strings = {}     # python_str -> label
         self.str_count = 0
 
-        # ✅ System V AMD64 integer arg registers
-        # arg0..arg5 map to rdi,rsi,rdx,rcx,r8,r9
+        # System V AMD64 integer arg registers
         self.fixed_map = {
             "arg0": "rdi", "arg1": "rsi", "arg2": "rdx",
             "arg3": "rcx", "arg4": "r8",  "arg5": "r9",
@@ -28,8 +29,22 @@ class CodeGenerator:
         self.slot_map = {}
         self.stack_size = 0
 
-        # optional: prevent duplicate "global foo"
+        # ✅ fixed-size allocas reserved in the frame
+        self.alloca_map = {}   # dest_vreg -> stack offset (bytes below rbp)
+
         self._globals_emitted = set()
+
+        # global tracking
+        self._used_globals = set()
+        self._defined_data_globals = set()
+        self._defined_bss_globals = set()
+        self._defined_text_globals = set()
+
+        # globals that must be treated as ADDRESSABLE OBJECTS (struct base / array base)
+        self._addr_globals = set()
+
+        # current function label prefix for IR labels
+        self._fn_prefix = ""
 
     def emit(self, line):
         self.output.append(line)
@@ -49,14 +64,29 @@ class CodeGenerator:
     def global_name(self, x: str) -> str:
         return x.split(":", 1)[1]
 
+    # ✅ address-of global form: addr_global:NAME
+    def is_addr_global(self, x) -> bool:
+        return isinstance(x, str) and x.startswith("addr_global:")
+
+    def addr_global_name(self, x: str) -> str:
+        return x.split(":", 1)[1]
+
+    # ----------------------------
+    # Label mangling
+    # ----------------------------
+    def mangle_label(self, label: str) -> str:
+        if not isinstance(label, str):
+            return label
+        if label == "":
+            return label
+        if label.startswith("fn_") and "__" in label:
+            return label
+        return f"{self._fn_prefix}{label}"
+
     # ----------------------------
     # String literal pooling
     # ----------------------------
     def intern_string(self, s: str) -> str:
-        """
-        Put a string into .rodata and return its label.
-        Emits as: label: db <bytes>, 0
-        """
         if s in self.strings:
             return self.strings[s]
 
@@ -90,30 +120,39 @@ class CodeGenerator:
         if value is None:
             raise Exception("Tried to load None")
 
-        # immediate integer
         if self.is_imm(value):
             self.emit(f"mov {into_reg}, {value}")
             return into_reg
 
-        # fixed names (args/ret)
+        # ✅ address-of global: always lea
+        if self.is_addr_global(value):
+            sym = self.addr_global_name(value)
+            self._used_globals.add(sym)
+            self.emit(f"lea {into_reg}, [rel {sym}]")
+            return into_reg
+
         if value in self.fixed_map:
             phys = self.fixed_map[value]
             if phys != into_reg:
                 self.emit(f"mov {into_reg}, {phys}")
             return into_reg
 
-        # globals: load from memory
         if self.is_global_ref(value):
             sym = self.global_name(value)
-            self.emit(f"mov {into_reg}, qword [rel {sym}]")
+            self._used_globals.add(sym)
+
+            # KEY RULE:
+            # If a global is used as a base pointer for field/index ops, treat it as an object => address.
+            if sym in self._addr_globals or sym in self._defined_bss_globals:
+                self.emit(f"lea {into_reg}, [rel {sym}]")
+            else:
+                self.emit(f"mov {into_reg}, qword [rel {sym}]")
             return into_reg
 
-        # vreg
         if self.is_vreg(value):
             self.emit(f"mov {into_reg}, {self.stack_ref(value)}")
             return into_reg
 
-        # already phys reg -> copy if needed
         if self.is_phys_reg(value) and value != into_reg:
             self.emit(f"mov {into_reg}, {value}")
             return into_reg
@@ -132,6 +171,7 @@ class CodeGenerator:
 
         if self.is_global_ref(dest):
             sym = self.global_name(dest)
+            self._used_globals.add(sym)
             self.emit(f"mov qword [rel {sym}], {from_reg}")
             return
 
@@ -145,10 +185,32 @@ class CodeGenerator:
     # Jump helpers
     # ----------------------------
     def jmp_near(self, label: str):
-        self.emit(f"jmp near {label}")
+        self.emit(f"jmp {self.mangle_label(label)}")
 
     def jcc_near(self, cc: str, label: str):
-        self.emit(f"j{cc} near {label}")
+        self.emit(f"j{cc} {self.mangle_label(label)}")
+
+    # ----------------------------
+    # Pre-scan IR to find globals used as address bases
+    # ----------------------------
+    def scan_addr_globals(self, funcs_ir):
+        self._addr_globals = set()
+        # include ptr-index ops too (argv-like bases etc)
+        base_ops = {
+            "load_field", "store_field",
+            "load_index", "store_index",
+            "load_ptr_index", "store_ptr_index",
+        }
+
+        for func in funcs_ir:
+            for ins in func.get("body", []):
+                if not isinstance(ins, dict):
+                    continue
+                op = ins.get("op")
+                if op in base_ops:
+                    base = ins.get("base")
+                    if self.is_global_ref(base):
+                        self._addr_globals.add(self.global_name(base))
 
     # ----------------------------
     # Top-level codegen entrypoint
@@ -159,6 +221,12 @@ class CodeGenerator:
         self.strings = {}
         self.str_count = 0
         self._globals_emitted = set()
+
+        self._used_globals = set()
+        self._defined_data_globals = set()
+        self._defined_bss_globals = set()
+        self._defined_text_globals = set()
+        self._fn_prefix = ""
 
         globals_ir = []
         funcs_ir = []
@@ -171,25 +239,59 @@ class CodeGenerator:
             elif item.get("type") == "Function":
                 funcs_ir.append(item)
 
-        # ---- .data globals ----
-        if globals_ir:
+        # function symbols
+        for f in funcs_ir:
+            self._defined_text_globals.add(f["name"])
+
+        # pre-scan to detect Buffer-like objects
+        self.scan_addr_globals(funcs_ir)
+
+        # Emit .data for scalar globals only; emit .bss for address-globals
+        data_lines = []
+        bss_lines = []
+
+        for g in globals_ir:
+            name = g["name"]
+            init = g.get("init", g.get("value", 0))
+            if isinstance(init, str) and re.fullmatch(r"-?\d+", init):
+                init = int(init)
+
+            if name in self._addr_globals:
+                # Treat as zeroed object storage (bootstrap-safe)
+                self._defined_bss_globals.add(name)
+                bss_lines.append(f"{name}: resb 256")
+                continue
+
+            if not isinstance(init, int):
+                raise Exception(f"Global '{name}' init must be int for now, got: {init!r}")
+
+            self._defined_data_globals.add(name)
+            data_lines.append(f"{name}: dq {init}")
+
+        if data_lines:
             self.emit("section .data")
-            for g in globals_ir:
-                name = g["name"]
-                init = g.get("init", g.get("value", 0))
-                if isinstance(init, str) and re.fullmatch(r"-?\d+", init):
-                    init = int(init)
-                if not isinstance(init, int):
-                    raise Exception(f"Global '{name}' init must be int for now, got: {init!r}")
-                self.emit(f"{name}: dq {init}")
+            for line in data_lines:
+                self.emit(line)
             self.emit("")
 
-        # ---- .text ----
         self.emit("section .text")
         for func in funcs_ir:
             self.generate_function(func)
 
-        # ---- .rodata ----
+        # unresolved globals => bss placeholders
+        unresolved = sorted(
+            (self._used_globals - self._defined_data_globals - self._defined_bss_globals) - self._defined_text_globals
+        )
+
+        if bss_lines or unresolved:
+            self.emit("")
+            self.emit("section .bss")
+            self.emit("align 8")
+            for line in bss_lines:
+                self.emit(line)
+            for sym in unresolved:
+                self.emit(f"{sym}: resb 256")
+
         if self.rodata:
             self.emit("")
             self.emit("section .rodata")
@@ -201,19 +303,37 @@ class CodeGenerator:
     def generate_function(self, func):
         self.slot_map = {}
         self.stack_size = 0
+        self.alloca_map = {}   # ✅ reset per-function
 
         name = func["name"]
+        self._fn_prefix = f"fn_{name}__"
 
         if name not in self._globals_emitted:
             self.emit(f"global {name}")
             self._globals_emitted.add(name)
 
         self.emit(f"{name}:")
-
         self.emit("push rbp")
         self.emit("mov rbp, rsp")
 
+        # ✅ ENTRY ABI FIX FOR _start (argc/argv come from initial stack)
+        # Kernel stack on entry (before we touch it):
+        #   [rsp + 0]  = argc
+        #   [rsp + 8]  = argv[0]
+        #   ...
+        # After push rbp / mov rbp,rsp:
+        #   [rbp + 8]  = argc
+        #   [rbp + 16] = argv[0]
+        #
+        # We map them into normal ABI registers so IR can use arg0/arg1.
+        if name == "_start":
+            self.emit("mov rdi, qword [rbp + 8]")   # argc
+            self.emit("lea rsi, [rbp + 16]")        # argv as &argv[0]
+            self.emit("")
+
         body = func.get("body", [])
+
+        # Pass 1: allocate stack slots (+ fixed-size allocas)
         for ins in body:
             for k in ("dest", "src", "src1", "src2", "base", "index", "value", "number"):
                 if k in ins and self.is_vreg(ins[k]):
@@ -223,10 +343,23 @@ class CodeGenerator:
                     if self.is_vreg(a):
                         self.alloc_slot(a)
 
-        # 16-byte alignment: after push rbp => rsp is 8 mod 16
+            if ins.get("op") == "alloca":
+                dest = ins["dest"]
+                size = ins.get("size", 0)
+                if isinstance(size, str) and self.is_imm(size):
+                    size = int(size)
+                if not isinstance(size, int) or size <= 0:
+                    raise Exception(f"alloca: size must be positive int, got {size!r}")
+
+                size_aligned = (size + 7) & ~7
+                self.stack_size += size_aligned
+                self.alloca_map[dest] = self.stack_size
+
+        # Align stack frame to 16 bytes
         frame = self.stack_size
-        if frame % 16 != 8:
-            frame += (8 - (frame % 16)) % 16
+        rem = frame % 16
+        if rem != 0:
+            frame += (16 - rem)
         self.stack_size = frame
 
         if self.stack_size:
@@ -241,6 +374,7 @@ class CodeGenerator:
             self.emit("ret")
 
         self.emit("")
+        self._fn_prefix = ""
 
     # ----------------------------
     # Instruction selection
@@ -258,60 +392,131 @@ class CodeGenerator:
         elif op == "shr": op = ">>"
         if op == "mod": op = "%"
 
-        # const
         if op == "const":
             v = instr["value"]
-
-            # string literal => address in register
             if isinstance(v, str) and not self.is_imm(v):
                 label = self.intern_string(v)
                 self.emit(f"lea {self.tmp1}, [rel {label}]")
                 self.store(instr["dest"], self.tmp1)
                 return
-
             tmp = self.load(str(v), self.tmp1)
             self.store(instr["dest"], tmp)
             return
 
-        # mov
         if op == "mov":
             tmp = self.load(instr["src"], self.tmp1)
             self.store(instr["dest"], tmp)
             return
 
+        if op == "alloca":
+            dest = instr["dest"]
+            off = self.alloca_map.get(dest)
+            if off is None:
+                raise Exception(f"alloca: missing frame reservation for {dest}")
+            self.emit(f"lea {self.tmp1}, [rbp - {off}]")
+            self.store(dest, self.tmp1)
+            return
+
+        if op == "addr_local":
+            src = instr["src"]
+            if not self.is_vreg(src):
+                raise Exception("addr_local: src must be vreg")
+            off = self.alloc_slot(src)
+            self.emit(f"lea {self.tmp1}, [rbp - {off}]")
+            self.store(instr["dest"], self.tmp1)
+            return
+
+        if op == "neg":
+            src = self.load(instr["src"], self.tmp1)
+            self.emit(f"neg {src}")
+            self.store(instr["dest"], src)
+            return
+
         # ----------------------------
-        # ✅ FIXED: byte indexing (scale 1) for strings / *byte-style pointers
+        # Indexing ops
         # ----------------------------
+
+        # byte indexing: *(base + idx) as unsigned byte
         if op == "load_index":
-            base = self.load(instr["base"], self.tmp1)     # r11 = base ptr
-            idx  = self.load(instr["index"], self.tmp2)    # r10 = idx
+            base = self.load(instr["base"], self.tmp1)
+            idx  = self.load(instr["index"], self.tmp2)
             if idx != "rcx":
                 self.emit(f"mov rcx, {idx}")
-
-            # read a byte, zero-extend to 64-bit
             self.emit(f"movzx {self.tmp1}, byte [{base} + rcx]")
             self.store(instr["dest"], self.tmp1)
             return
 
-        if op == "store_index":
-            base = self.load(instr["base"], self.tmp1)     # r11 = base ptr
-            idx  = self.load(instr["index"], self.tmp2)    # r10 = idx
+        # ✅ pointer indexing: *(base + idx*8) as qword
+        # Used for argv[i] where argv is &argv[0] (ptr* / char**)
+        if op == "load_ptr_index":
+            base = self.load(instr["base"], self.tmp1)
+            idx  = self.load(instr["index"], self.tmp2)
             if idx != "rcx":
                 self.emit(f"mov rcx, {idx}")
+            self.emit(f"mov {self.tmp1}, qword [{base} + rcx*8]")
+            self.store(instr["dest"], self.tmp1)
+            return
 
-            # now load value AFTER idx is in rcx (avoid clobber)
-            val = self.load(instr["value"], self.tmp2)     # r10 = val
+        if op == "store_index":
+            base = self.load(instr["base"], self.tmp1)
+            idx  = self.load(instr["index"], self.tmp2)
+            if idx != "rcx":
+                self.emit(f"mov rcx, {idx}")
+            val = self.load(instr["value"], self.tmp2)
             v8 = self.low8_map.get(val, None)
             if v8 is None:
-                # if val isn't a phys reg (rare), force into tmp2 then use tmp2b
                 if val != self.tmp2:
                     self.emit(f"mov {self.tmp2}, {val}")
                 v8 = self.low8_map[self.tmp2]
-
             self.emit(f"mov byte [{base} + rcx], {v8}")
             return
 
-        # arithmetic / bitwise
+        # (not currently used, but here for symmetry)
+        if op == "store_ptr_index":
+            base = self.load(instr["base"], self.tmp1)
+            idx  = self.load(instr["index"], self.tmp2)
+            if idx != "rcx":
+                self.emit(f"mov rcx, {idx}")
+            val = self.load(instr["value"], self.tmp2)
+            self.emit(f"mov qword [{base} + rcx*8], {val}")
+            return
+
+        # ----------------------------
+        # Struct field ops
+        # ----------------------------
+
+        if op == "load_field":
+            base = self.load(instr["base"], self.tmp1)
+            off = instr.get("offset", 0)
+            if isinstance(off, str) and self.is_imm(off):
+                off = int(off)
+            if not isinstance(off, int):
+                raise Exception(f"load_field: offset must be int, got {off!r}")
+            if off == 0:
+                self.emit(f"mov {self.tmp2}, qword [{base}]")
+            else:
+                self.emit(f"mov {self.tmp2}, qword [{base} + {off}]")
+            self.store(instr["dest"], self.tmp2)
+            return
+
+        if op == "store_field":
+            base = self.load(instr["base"], self.tmp1)
+            off = instr.get("offset", 0)
+            if isinstance(off, str) and self.is_imm(off):
+                off = int(off)
+            if not isinstance(off, int):
+                raise Exception(f"store_field: offset must be int, got {off!r}")
+            val = self.load(instr["value"], self.tmp2)
+            if off == 0:
+                self.emit(f"mov qword [{base}], {val}")
+            else:
+                self.emit(f"mov qword [{base} + {off}], {val}")
+            return
+
+        # ----------------------------
+        # ALU ops
+        # ----------------------------
+
         if op in ("add", "sub", "mul", "&", "|", "^"):
             a = self.load(instr["src1"], self.tmp1)
             b = self.load(instr["src2"], self.tmp2)
@@ -355,7 +560,6 @@ class CodeGenerator:
             self.store(instr["dest"], "rax" if op == "div" else "rdx")
             return
 
-        # comparisons
         if op in ("==", "!=", "<", "<=", ">", ">="):
             a = self.load(instr["src1"], self.tmp1)
             b = self.load(instr["src2"], self.tmp2)
@@ -380,9 +584,12 @@ class CodeGenerator:
             self.store(instr["dest"], self.tmp1)
             return
 
-        # labels / jumps
+        # ----------------------------
+        # CFG / calls / misc
+        # ----------------------------
+
         if op == "label":
-            self.emit(f"{instr['name']}:")
+            self.emit(f"{self.mangle_label(instr['name'])}:")
             return
 
         if op == "jmp":
@@ -396,7 +603,6 @@ class CodeGenerator:
             self.jcc_near("e", instr["label"])
             return
 
-        # call
         if op == "call":
             arg_regs = ["rdi", "rsi", "rdx", "rcx", "r8", "r9"]
             for i, arg in enumerate(instr["args"]):
@@ -407,7 +613,6 @@ class CodeGenerator:
             self.store(instr["dest"], "rax")
             return
 
-        # syscall
         if op == "syscall":
             self.load(instr["number"], "rax")
             arg_regs = ["rdi", "rsi", "rdx", "r10", "r8", "r9"]
@@ -419,7 +624,6 @@ class CodeGenerator:
             self.store(instr["dest"], "rax")
             return
 
-        # ret
         if op == "ret":
             v = instr.get("value")
             if v is not None:
@@ -429,15 +633,14 @@ class CodeGenerator:
             self.emit("ret")
             return
 
-        # cast
         if op == "cast":
             tmp = self.load(instr["src"], self.tmp1)
             self.store(instr["dest"], tmp)
             return
 
-        # gstore
         if op == "gstore":
             sym = instr["name"]
+            self._used_globals.add(sym)
             val = self.load(instr["value"], self.tmp1)
             self.emit(f"mov qword [rel {sym}], {val}")
             return

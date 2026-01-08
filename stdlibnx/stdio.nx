@@ -8,6 +8,10 @@ fn read(fd: int, buf: ptr, len: int) -> int {
   return syscall(0, fd, buf, len)
 }
 
+fn write(fd: int, buf: ptr, len: int) -> int {
+    return syscall(1, fd, buf, len)
+}
+
 fn close(fd: int) -> int {
   return syscall(3, fd)
 }

@@ -1,0 +1,238 @@
+import "stdlibnx/sys"
+import "stdlibnx/stdio"
+import "stdlibnx/memory"
+import "stdlibnx/string"
+import "stdlibnx/realloc"
+
+struct Buffer {
+    data: ptr
+    len: int
+    cap: int
+}
+
+fn buf_init(out: ptr) -> void {
+    let b = cast(out as *Buffer)
+    b.data = 0
+    b.len = 0
+    b.cap = 0
+}
+
+fn buf_grow(b: *Buffer, need: int) -> void {
+    if need <= b.cap { return }
+
+    let new_cap = b.cap
+    if new_cap == 0 { new_cap = 65536 }
+    while new_cap < need {
+        new_cap = new_cap * 2
+    }
+
+    if b.data == 0 {
+        b.data = malloc(new_cap)
+    } else {
+        b.data = realloc(b.data, new_cap)
+    }
+
+    if b.data == 0 { sys_exit(99) }
+    b.cap = new_cap
+}
+
+fn buf_push_bytes(b: *Buffer, src: ptr, n: int) -> void {
+    if n <= 0 { return }
+    let need = b.len + n
+    buf_grow(b, need)
+    memcpy(b.data + b.len, src, n)
+    b.len = b.len + n
+}
+
+fn buf_push_zeros(b: *Buffer, n: int) -> void {
+    if n <= 0 { return }
+    let need = b.len + n
+    buf_grow(b, need)
+    memset(b.data + b.len, 0, n)
+    b.len = b.len + n
+}
+
+// ----------------------------
+// ELF helpers (minimal ELF64 writer)
+// ----------------------------
+
+const ELF_BASE     = 4194304   // 0x400000
+const ELF_EHSZ     = 64
+const ELF_PHSZ     = 56
+const ELF_PHNUM    = 1
+const ELF_PHOFF    = 64
+const ELF_ALIGN    = 4096      // 0x1000
+const ELF_TEXT_OFF = 4096      // put code at file offset 0x1000 (simple)
+
+fn align_up(x: int, a: int) -> int {
+    return (x + (a - 1)) & ~(a - 1)
+}
+
+// --- Poke helpers with NO u8/uint8 typing ---
+// We write little-endian values by memcpy'ing bytes from an int tmp.
+// On x86_64, this produces correct LE encodings.
+
+// ----------------------------
+// Little-endian poke helpers (NO uint8 types)
+// ----------------------------
+
+// Store a single byte (0..255) into b.data[off].
+fn buf_poke_u8(b: *Buffer, off: int, v: int) -> void {
+    let byte = v & 255
+    let p = b.data
+    p[off] = byte
+}
+
+fn buf_poke_u16_le(b: *Buffer, off: int, v: int) -> void {
+    buf_poke_u8(b, off + 0, (v >> 0) & 255)
+    buf_poke_u8(b, off + 1, (v >> 8) & 255)
+}
+
+fn buf_poke_u32_le(b: *Buffer, off: int, v: int) -> void {
+    buf_poke_u8(b, off + 0,  (v >> 0)  & 255)
+    buf_poke_u8(b, off + 1,  (v >> 8)  & 255)
+    buf_poke_u8(b, off + 2,  (v >> 16) & 255)
+    buf_poke_u8(b, off + 3,  (v >> 24) & 255)
+}
+
+fn buf_poke_u64_le(b: *Buffer, off: int, v: int) -> void {
+    // all still int math; mask each byte
+    buf_poke_u8(b, off + 0,  (v >> 0)  & 255)
+    buf_poke_u8(b, off + 1,  (v >> 8)  & 255)
+    buf_poke_u8(b, off + 2,  (v >> 16) & 255)
+    buf_poke_u8(b, off + 3,  (v >> 24) & 255)
+    buf_poke_u8(b, off + 4,  (v >> 32) & 255)
+    buf_poke_u8(b, off + 5,  (v >> 40) & 255)
+    buf_poke_u8(b, off + 6,  (v >> 48) & 255)
+    buf_poke_u8(b, off + 7,  (v >> 56) & 255)
+}
+
+
+const O_RDONLY = 0
+const O_WRONLY = 1
+const O_CREAT  = 64
+const O_TRUNC  = 512
+const MODE_755 = 493
+
+fn read_file(out: ptr, path: ptr) -> int {
+    buf_init(out)
+    let b = cast(out as *Buffer)
+
+    let fd = open(path, O_RDONLY, 0)
+    if fd < 0 { return -1 }
+
+    let chunk = 4096
+    let tmpbuf = malloc(chunk)
+    if tmpbuf == 0 { close(fd) return -1 }
+
+    while 1 {
+        let n = read(fd, tmpbuf, chunk)
+        if n < 0 {
+            free(tmpbuf)
+            close(fd)
+            if b.data != 0 { free(b.data) }
+            buf_init(out)
+            return -1
+        }
+        if n == 0 { break }
+        buf_push_bytes(b, tmpbuf, n)
+    }
+
+    free(tmpbuf)
+    close(fd)
+    return 0
+}
+
+fn write_file(path: ptr, data: ptr, len: int) -> int {
+    let fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, MODE_755)
+    if fd < 0 { return -1 }
+
+    let off = 0
+    while off < len {
+        let n = write(fd, data + off, len - off)
+        if n <= 0 { close(fd) return -1 }
+        off = off + n
+    }
+
+    close(fd)
+    return 0
+}
+
+fn link_one(out: *Buffer, obj: *Buffer) -> int {
+    // Bootstrap "linker":
+    // Treat obj as raw x86_64 machine code (.text) and wrap it in a minimal ELF64 ET_EXEC.
+
+    if obj == 0 || obj.data == 0 || obj.len <= 0 { return -1 }
+
+    buf_init(out)
+
+    // Reserve space for ELF header + one program header
+    buf_push_zeros(out, ELF_EHSZ + ELF_PHSZ)
+
+    // Pad up to text offset (0x1000)
+    let cur = out.len
+    if cur > ELF_TEXT_OFF { return -1 }
+    buf_push_zeros(out, ELF_TEXT_OFF - cur)
+
+    // Append raw code bytes
+    buf_push_bytes(out, obj.data, obj.len)
+
+    let file_sz = out.len
+    let entry   = ELF_BASE + ELF_TEXT_OFF
+
+    // ---- ELF header ----
+    buf_poke_u8(out, 0, 127)  // 0x7F
+    buf_poke_u8(out, 1, 69)   // 'E'
+    buf_poke_u8(out, 2, 76)   // 'L'
+    buf_poke_u8(out, 3, 70)   // 'F'
+    buf_poke_u8(out, 4, 2)   // ELFCLASS64
+    buf_poke_u8(out, 5, 1)   // little-endian
+    buf_poke_u8(out, 6, 1)   // EV_CURRENT
+    buf_poke_u8(out, 7, 0)   // System V ABI
+
+    buf_poke_u16_le(out, 16, 2)         // e_type = ET_EXEC
+    buf_poke_u16_le(out, 18, 62)        // e_machine = EM_X86_64
+    buf_poke_u32_le(out, 20, 1)         // e_version
+    buf_poke_u64_le(out, 24, entry)     // e_entry
+    buf_poke_u64_le(out, 32, ELF_PHOFF) // e_phoff
+    buf_poke_u64_le(out, 40, 0)         // e_shoff
+    buf_poke_u32_le(out, 48, 0)         // e_flags
+    buf_poke_u16_le(out, 52, ELF_EHSZ)  // e_ehsize
+    buf_poke_u16_le(out, 54, ELF_PHSZ)  // e_phentsize
+    buf_poke_u16_le(out, 56, ELF_PHNUM) // e_phnum
+    buf_poke_u16_le(out, 58, 0)         // e_shentsize
+    buf_poke_u16_le(out, 60, 0)         // e_shnum
+    buf_poke_u16_le(out, 62, 0)         // e_shstrndx
+
+    // ---- Program header (PT_LOAD) ----
+    let ph = ELF_PHOFF
+    buf_poke_u32_le(out, ph + 0, 1)          // p_type = PT_LOAD
+    buf_poke_u32_le(out, ph + 4, 5)          // p_flags = PF_R | PF_X
+    buf_poke_u64_le(out, ph + 8, 0)          // p_offset
+    buf_poke_u64_le(out, ph + 16, ELF_BASE)  // p_vaddr
+    buf_poke_u64_le(out, ph + 24, ELF_BASE)  // p_paddr
+    buf_poke_u64_le(out, ph + 32, file_sz)   // p_filesz
+    buf_poke_u64_le(out, ph + 40, file_sz)   // p_memsz
+    buf_poke_u64_le(out, ph + 48, ELF_ALIGN) // p_align
+
+    return 0
+}
+
+fn _start(argc: int, argv: *ptr) -> void {
+    if argc < 2 { sys_exit(64) }
+
+    let obj: Buffer
+    let path = argv[1]
+
+    if read_file(&obj, path) != 0 { sys_exit(1) }
+    if obj.data == 0 || obj.len == 0 { sys_exit(1) }
+
+    let exe: Buffer
+    if link_one(&exe, &obj) != 0 { sys_exit(2) }
+    if exe.data == 0 || exe.len == 0 { sys_exit(2) }
+
+    let rc = write_file("a.out", exe.data, exe.len)
+    if rc != 0 { sys_exit(3) }
+
+    sys_exit(0)
+}

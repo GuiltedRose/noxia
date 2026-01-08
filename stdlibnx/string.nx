@@ -5,6 +5,15 @@ fn memset(dest: ptr, val: int, len: int) -> void {
     }
 }
 
+fn memcpy(dest: ptr, src: ptr, len: int) -> ptr {
+    let d = cast(dest as *byte)
+    let s = cast(src as *byte)
+    for let i = 0, i < len, i = i + 1 {
+        d[i] = s[i]
+    }
+    return dest
+}
+
 fn strlen(s: ptr) -> int {
     let p = cast(s as *byte)
     let i = 0

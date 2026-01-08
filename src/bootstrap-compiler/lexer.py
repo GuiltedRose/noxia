@@ -2,6 +2,7 @@ KEYWORDS = {
     "let", "fn", "match", "return", "if", "else", "true", "false",
     "class", "public", "private", "const", "struct", "enum", "import",
     "as", "global", "cast", "extern", "type", "while", "for", "static",
+    "break", "continue"
 }
 
 # lexer will emit IDENT, not TYPE.
@@ -14,7 +15,7 @@ BUILTIN_TYPES = {
 
 SYMBOLS = {
     '(', ')', '{', '}', '[', ']', ':', '&', ',', '=', '+', '-', '*', '%', '/',
-    '<', '>', '!', '|', '.',  # '.' is useful for future member access
+    '<', '>', '!', '|', '.', '~', '^'
 }
 
 MULTI_CHAR_TOKENS = {
