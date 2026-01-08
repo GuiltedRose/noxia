@@ -68,15 +68,10 @@ fn align_up(x: int, a: int) -> int {
     return (x + (a - 1)) & ~(a - 1)
 }
 
-// --- Poke helpers with NO u8/uint8 typing ---
-// We write little-endian values by memcpy'ing bytes from an int tmp.
-// On x86_64, this produces correct LE encodings.
-
 // ----------------------------
 // Little-endian poke helpers (NO uint8 types)
 // ----------------------------
 
-// Store a single byte (0..255) into b.data[off].
 fn buf_poke_u8(b: *Buffer, off: int, v: int) -> void {
     let byte = v & 255
     let p = b.data
@@ -96,7 +91,6 @@ fn buf_poke_u32_le(b: *Buffer, off: int, v: int) -> void {
 }
 
 fn buf_poke_u64_le(b: *Buffer, off: int, v: int) -> void {
-    // all still int math; mask each byte
     buf_poke_u8(b, off + 0,  (v >> 0)  & 255)
     buf_poke_u8(b, off + 1,  (v >> 8)  & 255)
     buf_poke_u8(b, off + 2,  (v >> 16) & 255)
@@ -106,7 +100,6 @@ fn buf_poke_u64_le(b: *Buffer, off: int, v: int) -> void {
     buf_poke_u8(b, off + 6,  (v >> 48) & 255)
     buf_poke_u8(b, off + 7,  (v >> 56) & 255)
 }
-
 
 const O_RDONLY = 0
 const O_WRONLY = 1
@@ -123,7 +116,10 @@ fn read_file(out: ptr, path: ptr) -> int {
 
     let chunk = 4096
     let tmpbuf = malloc(chunk)
-    if tmpbuf == 0 { close(fd) return -1 }
+    if tmpbuf == 0 {
+        close(fd)
+        return -1
+    }
 
     while 1 {
         let n = read(fd, tmpbuf, chunk)
@@ -150,7 +146,10 @@ fn write_file(path: ptr, data: ptr, len: int) -> int {
     let off = 0
     while off < len {
         let n = write(fd, data + off, len - off)
-        if n <= 0 { close(fd) return -1 }
+        if n <= 0 {
+            close(fd)
+            return -1
+        }
         off = off + n
     }
 
@@ -161,8 +160,14 @@ fn write_file(path: ptr, data: ptr, len: int) -> int {
 fn link_one(out: *Buffer, obj: *Buffer) -> int {
     // Bootstrap "linker":
     // Treat obj as raw x86_64 machine code (.text) and wrap it in a minimal ELF64 ET_EXEC.
+    //
+    // IMPORTANT: We produce a single PT_LOAD segment that is RWX during bootstrap.
+    // If we mark it RX only (PF_R|PF_X), any stores to memory mapped in this segment
+    // (globals/bss, etc.) will segfault.
 
-    if obj == 0 || obj.data == 0 || obj.len <= 0 { return -1 }
+    if obj == 0 { return -1 }
+    if obj.data == 0 { return -1 }
+    if obj.len <= 0 { return -1 }
 
     buf_init(out)
 
@@ -172,23 +177,28 @@ fn link_one(out: *Buffer, obj: *Buffer) -> int {
     // Pad up to text offset (0x1000)
     let cur = out.len
     if cur > ELF_TEXT_OFF { return -1 }
-    buf_push_zeros(out, ELF_TEXT_OFF - cur)
+    let pad = ELF_TEXT_OFF - cur
+    if pad < 0 { return -1 }
+    buf_push_zeros(out, pad)
 
     // Append raw code bytes
     buf_push_bytes(out, obj.data, obj.len)
 
+    // file size
     let file_sz = out.len
-    let entry   = ELF_BASE + ELF_TEXT_OFF
+
+    // entry = base + text offset
+    let entry = ELF_BASE + ELF_TEXT_OFF
 
     // ---- ELF header ----
     buf_poke_u8(out, 0, 127)  // 0x7F
     buf_poke_u8(out, 1, 69)   // 'E'
     buf_poke_u8(out, 2, 76)   // 'L'
     buf_poke_u8(out, 3, 70)   // 'F'
-    buf_poke_u8(out, 4, 2)   // ELFCLASS64
-    buf_poke_u8(out, 5, 1)   // little-endian
-    buf_poke_u8(out, 6, 1)   // EV_CURRENT
-    buf_poke_u8(out, 7, 0)   // System V ABI
+    buf_poke_u8(out, 4, 2)    // ELFCLASS64
+    buf_poke_u8(out, 5, 1)    // little-endian
+    buf_poke_u8(out, 6, 1)    // EV_CURRENT
+    buf_poke_u8(out, 7, 0)    // System V ABI
 
     buf_poke_u16_le(out, 16, 2)         // e_type = ET_EXEC
     buf_poke_u16_le(out, 18, 62)        // e_machine = EM_X86_64
@@ -207,7 +217,10 @@ fn link_one(out: *Buffer, obj: *Buffer) -> int {
     // ---- Program header (PT_LOAD) ----
     let ph = ELF_PHOFF
     buf_poke_u32_le(out, ph + 0, 1)          // p_type = PT_LOAD
-    buf_poke_u32_le(out, ph + 4, 5)          // p_flags = PF_R | PF_X
+
+    // ✅ FIX: RWX during bootstrap (PF_R|PF_W|PF_X = 7)
+    buf_poke_u32_le(out, ph + 4, 7)          // p_flags
+
     buf_poke_u64_le(out, ph + 8, 0)          // p_offset
     buf_poke_u64_le(out, ph + 16, ELF_BASE)  // p_vaddr
     buf_poke_u64_le(out, ph + 24, ELF_BASE)  // p_paddr
@@ -225,11 +238,13 @@ fn _start(argc: int, argv: *ptr) -> void {
     let path = argv[1]
 
     if read_file(&obj, path) != 0 { sys_exit(1) }
-    if obj.data == 0 || obj.len == 0 { sys_exit(1) }
+    if obj.data == 0 { sys_exit(1) }
+    if obj.len == 0 { sys_exit(1) }
 
     let exe: Buffer
     if link_one(&exe, &obj) != 0 { sys_exit(2) }
-    if exe.data == 0 || exe.len == 0 { sys_exit(2) }
+    if exe.data == 0 { sys_exit(2) }
+    if exe.len == 0 { sys_exit(2) }
 
     let rc = write_file("a.out", exe.data, exe.len)
     if rc != 0 { sys_exit(3) }
